@@ -123,3 +123,41 @@ before running through an earlier wait loop. There is no way to make the
 whole program run unattended from reset without that information.
 
 TKIP acceleration (`tkiph`/`tkiphs`/`tkipl`/`tkipls`) is not implemented.
+
+
+Companion tools
+---------------
+
+`cond.py` parses OpenFWWF's `cond.inc` (github.com/fullstory/openfwwf) into the
+external-condition map, so the jext/jnext signals the executor stubs can be
+referred to by name and turned into `ext_flags` seeds:
+
+    ./cond.py                       # list COND_* -> selector
+    python3 -c "from cond import CondMap; print(hex(CondMap.load().by_name('TX.MACEN')))"
+
+Seeding the matching condition steers the real dispatcher: from the main loop,
+with `COND_RX_COMPLETE` forced the ucode enters its RX handler where unseeded it
+idles. The names are OpenFWWF's corerev-5 (arch5) names; the selector layout and
+`COND_TRUE=0x7F` carry over to the arch15 cores, but a given FIXME bit is a lead
+for a newer core, not a guarantee.
+
+`ucode_init.py` runs just the version-stamp prologue and dumps the shared
+memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
+`cond.py`, the jext/jnext conditions a blob tests:
+
+    ./ucode_init.py d11ucode42.bin --out ucode.shm
+    ./extcond_scan.py d11ucode42.bin
+
+`cosim.py` runs the real ucode against a host MMIO trace, sharing one state so
+the microcode reads what the host wrote and writes back, then snapshots the
+complete D11 state (shared memory, scratch, RCMTA, template RAM, the MMIO/IHR
+register file, and the PSM's own GPR/SPR):
+
+    ./cosim.py host.ops d11ucode42.bin --out d11.state
+
+The input op stream is the decoded-MMIO vocabulary of the b43 AC-PHY port's
+`reverse-tools/mmio2ops.py`. The boot hand-off runs the validated version-stamp;
+per-command hand-offs run the main loop, but a command the ucode picks up by
+reading the MAC command register dispatches through IHR reads this interpreter
+does not model, so those handlers do not run (the command is recorded, and
+whatever the host routed through shared memory for it is still applied).
