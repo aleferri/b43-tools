@@ -117,3 +117,27 @@ handshake of the boot, then the main loop's external conditions.
 `rets` 5) has no operands and no known meaning; it is executed as a no-op.
 
 TKIP acceleration (`tkiph`/`tkiphs`/`tkipl`/`tkipls`) is not implemented.
+
+
+Companion tools
+---------------
+
+`cond.py` parses OpenFWWF's `cond.inc` (github.com/fullstory/openfwwf) into the
+external-condition map, so the jext/jnext signals the executor stubs can be
+referred to by name and turned into `ext_flags` seeds:
+
+    ./cond.py                       # list COND_* -> selector
+    python3 -c "from cond import CondMap; print(hex(CondMap.load().by_name('TX.MACEN')))"
+
+Seeding the matching condition steers the real dispatcher: from the main loop,
+with `COND_RX_COMPLETE` forced the ucode enters its RX handler where unseeded it
+idles. The names are OpenFWWF's corerev-5 (arch5) names; the selector layout and
+`COND_TRUE=0x7F` carry over to the arch15 cores, but a given FIXME bit is a lead
+for a newer core, not a guarantee.
+
+`ucode_init.py` runs just the version-stamp prologue and dumps the shared
+memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
+`cond.py`, the jext/jnext conditions a blob tests:
+
+    ./ucode_init.py d11ucode42.bin --out ucode.shm
+    ./extcond_scan.py d11ucode42.bin
