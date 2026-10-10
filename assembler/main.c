@@ -308,17 +308,17 @@ static unsigned int generate_reg_operand(struct assembler_context *ctx,
 		val |= 0x800;
 		if (ctx->arch == 15)
 			val <<= 1;
-		if (reg->nr & ~0x1FF)
+		if (reg->nr & ~(ctx->arch == 15 ? 0x3FF : 0x1FF))
 			asm_error(ctx, "SPR-nr too big");
 		val |= reg->nr;
 		break;
 	case OFFR:
-		val |= 0x860;
+		val |= 0x800;
 		if (ctx->arch == 15)
 			val <<= 1;
 		if (reg->nr & ~0x7)
 			asm_error(ctx, "OFFR-nr too big");
-		val |= reg->nr;
+		val |= 0x060 + reg->nr;
 		break;
 	default:
 		asm_error(ctx, "generate_reg_operand() regtype");
