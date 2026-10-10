@@ -52,8 +52,9 @@ are OpenFWWF's corerev-5 ones, not verified on corerev 42.
 TX engine (--tx-engine IFS,START,DONE, in PSM instructions): a model of
 OpenFWWF's transmit sequence, not a known semantic. Setting bit 0 of
 SPR_TXE0_CTL (0x080) raises COND_TX_NOW after IFS instructions; a write of
-SPR 0x320 with bits 15 and 0 set, which the 0x3A0 builds make once a frame
-is set up, raises COND_TX_POWER after START and COND_TX_DONE after DONE.
+SPR 0x320 (SPR_TX_Serial_Control) with bit 15 set, which both families make
+once a frame is set up (0x8001 for a queued frame, 0x8000 for the beacon),
+raises COND_TX_POWER after START and COND_TX_DONE after DONE.
 Each stays raised until the ucode acknowledges it with an EOI jext/jnext.
 Without it no frame ever completes, and neither does a MAC suspend that
 waits for one.
@@ -65,15 +66,31 @@ is what the ucode does with the state the host builds.
 Input lines are `cpuN CLASS key=val ...` (test/integration) or
 `<ts> #<n> cpuN CLASS key=val ...` (vendor captures, mmio2ops.py).
 
+With --psm-mhz F the TSF advances by one microsecond every F instructions,
+the rate of a PSM that runs one instruction per cycle at F MHz (a model: the
+clock and the cycles per instruction of the corerev 42 PSM are not known).
+The ucode reads it as SPR_TSF_WORD0..3 (0x119..0x11C); host writes to them
+(MMIO 0x632..0x638) or to the 32-bit TSF registers at MMIO 0x180/0x184 set it.
+Without the option the TSF stays where the host leaves it.
+
+With the TSF running, the beacon interval the host programs (MMIO 0x188
+tsf_cfprep, the interval in microseconds << 6, and 0x18C tsf_cfpstart, the
+first TBTT) raises COND_TX_TBTTEXPIRE (0x2C) each time the TSF reaches a TBTT,
+held until the ucode acknowledges it with an EOI like the TX engine events.
+An op `cpuN WAIT us=0x...` lets that many microseconds pass: the ucode runs,
+and while it is idle the clock jumps to the next TBTT.
+
 With --settle the PSM runs after each host operation until it is back at a
-(pc, call stack, carry) it already reached with no net change in between:
-from there only the host can change its state. The report then adds a
-timetable in PSM instructions: how long the ucode works after each host
-operation, when it raises IRQ bits, and which shared-memory words it wrote
-that the host reads later. PHY transactions complete at once here, so the
-counts of code that waits on them are lower bounds.
+(pc, call stack, carry) it already reached with no net change and, with
+--psm-mhz, no read of the TSF in between: from there only the host can change
+its state. The report then adds a timetable in PSM instructions: how long the
+ucode works after each host operation, when it raises IRQ bits, and which
+shared-memory words it wrote that the host reads later. PHY transactions
+complete at once here, so the counts of code that waits on them are lower
+bounds.
 
     lockstep.py OPS BLOB [--cycles 100 | --settle MAX] [--initvals FILE ...]
+                [--tx-engine IFS,START,DONE] [--psm-mhz F]
                 [--report FILE] [--cond-inc FILE]
 """
 
@@ -98,7 +115,12 @@ COND_MACEN = 0x24
 COND_TX_NOW, COND_TX_POWER, COND_TX_DONE = 0x20, 0x21, 0x22
 CONDREG_BRC = 0x40              # condition register 4 mirrors SPR_BRC
 SPR_BRC, SPR_TXE0_CTL, SPR_TXE_CMD = 0x048, 0x080, 0x320
-TXE_CMD_GO = 0x8001
+TXE_CMD_GO = 0x8000
+SPR_TSF_WORD0 = 0x119           # SPR_TSF_WORD0..3, MMIO 0x632..0x638
+TSF_SPRS = range(SPR_TSF_WORD0, SPR_TSF_WORD0 + 4)
+TSF_TIMERLOW, TSF_TIMERHIGH = 0x180, 0x184
+TSF_CFPREP, TSF_CFPSTART, CFPREP_CBI_SHIFT = 0x188, 0x18C, 6
+COND_TBTT = 0x2C                # OpenFWWF's COND_TX_TBTTEXPIRE
 IRQ_MAC_SUSPENDED = 0x0001
 HOSTF_WORDS = (0x05E >> 1, 0x060 >> 1, 0x062 >> 1, 0x078 >> 1, 0x0D4 >> 1)
 OBJADDR, OBJDATA, OBJDATA_HI = 0x160, 0x164, 0x166
@@ -127,7 +149,7 @@ def load_inits(path):
 
 
 class Lockstep:
-    def __init__(self, prog, cycles, settle=None, inits=None, tx=None):
+    def __init__(self, prog, cycles, settle=None, inits=None, tx=None, mhz=None):
         self.prog = prog
         self.m = psm.PSM(prog)
         self.m.stall_threshold = float("inf")
@@ -137,6 +159,12 @@ class Lockstep:
         self.events = set()             # raised TX conditions
         self.pending = []               # (step, condition) still to raise
         self.tx_log = []                # (op_id, offset, condition)
+        self.mhz = mhz                  # instructions per TSF microsecond
+        self.clock = 0                  # time, in PSM instructions
+        self.tsf_base, self.tsf_clock = 0, 0
+        self.tbtt_us, self.next_tbtt = 0, None
+        self.tbtt_log = []              # (op_id, TSF) of each TBTT raised
+        self.tsf_read_at = -1           # step of the last ucode read of the TSF
         self.cycles = cycles
         self.settle_max = settle
         self.inits = inits or []
@@ -168,12 +196,52 @@ class Lockstep:
         self.m.spr[n] = val & 0xFFFF
         self.host_spr.add(n)
 
+    def tsf(self):
+        return self.tsf_base + int((self.clock - self.tsf_clock) / self.mhz)
+
+    def tsf_set(self, value):
+        self.tsf_base, self.tsf_clock = value & (1 << 64) - 1, self.clock
+        self.tbtt_align()
+
+    def tbtt_align(self):
+        if self.next_tbtt is not None and self.tbtt_us:
+            t = self.tsf()
+            while self.next_tbtt <= t:
+                self.next_tbtt += self.tbtt_us
+
+    def tbtt_due_clock(self):
+        """The clock at which the TSF reaches the next TBTT, or None."""
+        if self.next_tbtt is None:
+            return None
+        return self.tsf_clock + (self.next_tbtt - self.tsf_base) * self.mhz
+
+    def tsf_set_word(self, i, val):
+        shift = 16 * i
+        self.tsf_set(self.tsf() & ~(0xFFFF << shift) | (val & 0xFFFF) << shift)
+
+    def tsf_publish(self):
+        t = self.tsf()
+        for i in range(4):
+            self.m.spr[SPR_TSF_WORD0 + i] = t >> 16 * i & 0xFFFF
+
     def reg_write(self, off, val, width):
-        if off >= IHR_BASE:
+        if self.mhz and off == TSF_CFPREP:
+            self.tbtt_us = (val & 0xFFFFFFFF) >> CFPREP_CBI_SHIFT
+            self.tbtt_align()
+        elif self.mhz and off == TSF_CFPSTART:
+            self.next_tbtt = val & 0xFFFFFFFF
+            self.tbtt_align()
+        elif self.mhz and off in (TSF_TIMERLOW, TSF_TIMERHIGH):
+            shift = 0 if off == TSF_TIMERLOW else 32
+            self.tsf_set(self.tsf() & ~(0xFFFFFFFF << shift) | (val & 0xFFFFFFFF) << shift)
+        elif off >= IHR_BASE:
             n = (off - IHR_BASE) >> 1
-            self.spr_write(n, val)
-            if width == 8:
-                self.spr_write(n + 1, val >> 16)
+            for k, part in ((n, val), (n + 1, val >> 16))[:2 if width == 8 else 1]:
+                if self.mhz and k in TSF_SPRS:
+                    self.tsf_set_word(k - SPR_TSF_WORD0, part)
+                    self.host_spr.add(k)
+                else:
+                    self.spr_write(k, part)
         elif off == MACCMD:
             self.spr_write(SPR_MAC_CMD, val)
         elif off == IRQ_REASON:
@@ -270,6 +338,13 @@ class Lockstep:
         brc = m.spr.get(SPR_BRC, 0)
         for bit in range(16):
             flags[CONDREG_BRC | bit] = bool(brc >> bit & 1)
+        if self.mhz and self.next_tbtt is not None and self.tsf() >= self.next_tbtt:
+            self.events.add(COND_TBTT)
+            self.tbtt_log.append((self.op_id, self.next_tbtt))
+            if self.tbtt_us:
+                self.tbtt_align()
+            else:
+                self.next_tbtt = None
         if self.pending:
             due = [p for p in self.pending if p[0] <= self.steps]
             for p in due:
@@ -285,6 +360,8 @@ class Lockstep:
         kind, n = loc
         if self.tx and kind == "spr":
             self.tx_schedule(loc, old, new)
+        if self.mhz and kind == "spr" and n in TSF_SPRS:
+            self.tsf_set_word(n - SPR_TSF_WORD0, new)
         if kind == "spr" and n in (SPR_IRQ_LO, SPR_IRQ_HI):
             self.irqs.append((self.op_id, self.op_desc, offset, n, new))
             if n == SPR_IRQ_LO and new & IRQ_MAC_SUSPENDED and self.inits_state == "wait":
@@ -304,11 +381,16 @@ class Lockstep:
             self.running = False
             return False
         ins = prog[pc]
+        if self.mhz:
+            self.tsf_publish()
         self.conditions()
         self.pcs[pc] += 1
         for op in (ins.op0, ins.op1):
-            if op is not None and op.kind == "spr" and \
-                    op.value not in m.spr and op.value not in self.host_spr:
+            if op is None or op.kind != "spr":
+                continue
+            if self.mhz and op.value in TSF_SPRS:
+                self.tsf_read_at = self.steps
+            elif op.value not in m.spr and op.value not in self.host_spr:
                 self.hw_reads[(op.value, pc)] += 1
         if ins.mnem in ("jext", "jnext"):
             sel = ins.extra["imm"]
@@ -323,6 +405,7 @@ class Lockstep:
             self.running = False
             return False
         self.steps += 1
+        self.clock += 1
         cmd = m.spr.get(SPR_EXT_IHR_ADDR, 0)
         if cmd & EXT_IHR_GO:
             self.ext_ihr(cmd)
@@ -350,7 +433,8 @@ class Lockstep:
             key = (m.pc, tuple(m.call_stack), m.spr.get("__carry__", 0),
                    tuple(sorted(self.events)))
             prev = seen.get(key)
-            if prev is not None and not self.pending and self.unchanged_since(prev[1]):
+            if prev is not None and not self.pending and \
+                    self.tsf_read_at < prev[0] and self.unchanged_since(prev[1]):
                 return prev[0] - start, m.pc
             seen[key] = (self.steps, len(self.changes))
             if not self.step():
@@ -388,7 +472,10 @@ class Lockstep:
                     continue
                 self.ops += 1
                 self.op_start = self.steps
-                if not self.running:
+                if self.op_desc.startswith("WAIT"):
+                    self.wait(fields(self.op_desc).get("us", (0,))[0])
+                    idle = False
+                elif not self.running:
                     idle = False
                 elif self.settle_max is None:
                     self.run(self.cycles)
@@ -398,6 +485,28 @@ class Lockstep:
                     if steps:
                         self.reactions.append((self.op_id, self.op_desc, steps, pc))
                     idle = pc is not None
+
+    def wait(self, us):
+        """Let `us` microseconds of TSF pass. The ucode runs; while it is idle
+        nothing it could observe changes but the TSF, so the clock jumps to
+        the next TBTT or to the end of the wait."""
+        if not self.mhz or self.settle_max is None:
+            raise SystemExit("WAIT needs --psm-mhz and --settle")
+        end = self.clock + us * self.mhz
+        while self.clock < end:
+            if not self.running:
+                self.clock = end
+                break
+            steps, pc = self.settle()
+            if steps:
+                self.reactions.append((self.op_id, f"WAIT, TSF {self.tsf()}", steps, pc))
+            if pc is None:
+                continue
+            due = self.tbtt_due_clock()
+            if due is None or due >= end:
+                self.clock = end
+                break
+            self.clock = max(self.clock, int(due) + 1)
 
     # ---- report ----
     def describe(self, pc):
@@ -446,6 +555,10 @@ class Lockstep:
             w(" TX engine conditions raised (op, +steps, condition):\n")
             for op_id, off, sel in self.tx_log:
                 w(f"  #{op_id:<8d} +{off:<7d} 0x{sel:02X} {label(sel)}\n")
+        if self.tbtt_log:
+            w(f" TBTTs raised (op, TSF): {len(self.tbtt_log)}\n")
+            for op_id, t in self.tbtt_log[:20]:
+                w(f"  #{op_id:<8d} {t}\n")
         w(" IRQ bits the ucode raised (op, +steps, register, bits):\n")
         for op_id, desc, off, n, bits in self.irqs:
             w(f"  #{op_id:<8d} +{off:<7d} spr{n:03X} {bits:#06x}  {desc[:50]}\n")
@@ -478,6 +591,8 @@ def main():
                          "(repeatable: initvals, then bsinitvals)")
     ap.add_argument("--tx-engine", metavar="IFS,START,DONE",
                     help="model the TX engine with these delays, in PSM instructions")
+    ap.add_argument("--psm-mhz", type=float, metavar="F",
+                    help="advance the TSF by 1 us every F PSM instructions")
     ap.add_argument("--report")
     ap.add_argument("--cond-inc", help="OpenFWWF cond.inc, to name the selectors")
     args = ap.parse_args()
@@ -490,7 +605,8 @@ def main():
 
     inits = [e for p in args.initvals for e in load_inits(p)]
     tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
-    ls = Lockstep(psm.load_program(args.blob), args.cycles, args.settle, inits, tx)
+    ls = Lockstep(psm.load_program(args.blob), args.cycles, args.settle, inits, tx,
+                  args.psm_mhz)
     ls.feed(args.ops)
     out = open(args.report, "w") if args.report else sys.stdout
     ls.report(out, label)
