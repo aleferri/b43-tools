@@ -393,14 +393,14 @@ static void disasm_constant_opcodes(struct disassembler_context *ctx,
 		disasm_std_operand(stmt, 2, 2);
 		break;
 	case 0x040:
-		stmt->u.insn.name = "jand";
+		stmt->u.insn.name = "jnand";
 		stmt->u.insn.labelref_operand = 2;
 		stmt->u.insn.labeladdr = stmt->u.insn.bin->operands[2];
 		disasm_std_operand(stmt, 0, 0);
 		disasm_std_operand(stmt, 1, 1);
 		break;
 	case (0x040 | 0x1):
-		stmt->u.insn.name = "jnand";
+		stmt->u.insn.name = "jand";
 		stmt->u.insn.labelref_operand = 2;
 		stmt->u.insn.labeladdr = stmt->u.insn.bin->operands[2];
 		disasm_std_operand(stmt, 0, 0);

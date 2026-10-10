@@ -78,8 +78,8 @@ testlabel:
 
 	/* Jumps */
 	jmp	label		/* unconditional jump */
-	jand	r0,r1,label	/* jump if binary AND */
-	jnand	r0,r1,label	/* jump if not binary AND */
+	jand	r0,r1,label	/* jump if binary AND is nonzero */
+	jnand	r0,r1,label	/* jump if binary AND is zero */
 	js	r0,r1,label	/* jump if all bits set */
 	jns	r0,r1,label	/* jump if not all bits set */
 	je	r0,r1,label	/* jump if equal */

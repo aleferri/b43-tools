@@ -694,9 +694,9 @@ static void emulate_jand_insn(struct assembler_context *ctx,
 			last_bit = ffs(~(tmp >> (first_bit - 1))) - 1 + first_bit - 1;
 
 			if (inverted)
-				em_insn.op = OP_JZX;
-			else
 				em_insn.op = OP_JNZX;
+			else
+				em_insn.op = OP_JZX;
 			em_op_shift.type = OPER_RAW;
 			em_op_shift.u.raw = first_bit - 1;
 			em_op_mask.type = OPER_RAW;
@@ -806,10 +806,10 @@ static void assemble_instruction(struct assembler_context *ctx,
 		emulate_jmp_insn(ctx, insn);
 		return;
 	case OP_JAND:
-		emulate_jand_insn(ctx, insn, 0);
+		emulate_jand_insn(ctx, insn, 1);
 		return;
 	case OP_JNAND:
-		emulate_jand_insn(ctx, insn, 1);
+		emulate_jand_insn(ctx, insn, 0);
 		return;
 	case OP_JS:
 		out = do_assemble_insn(ctx, insn, 0x050);
