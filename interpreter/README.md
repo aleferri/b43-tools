@@ -141,3 +141,17 @@ memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
 
     ./ucode_init.py d11ucode42.bin --out ucode.shm
     ./extcond_scan.py d11ucode42.bin
+
+`cosim.py` runs the real ucode against a host MMIO trace, sharing one state so
+the microcode reads what the host wrote and writes back, then snapshots the
+complete D11 state (shared memory, scratch, RCMTA, template RAM, the MMIO/IHR
+register file, and the PSM's own GPR/SPR):
+
+    ./cosim.py host.ops d11ucode42.bin --out d11.state
+
+The input op stream is the decoded-MMIO vocabulary of the b43 AC-PHY port's
+`reverse-tools/mmio2ops.py`. The boot hand-off runs the validated version-stamp;
+per-command hand-offs run the main loop, but a command the ucode picks up by
+reading the MAC command register dispatches through IHR reads this interpreter
+does not model, so those handlers do not run (the command is recorded, and
+whatever the host routed through shared memory for it is still applied).
