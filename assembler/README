@@ -20,8 +20,8 @@ mul       | A,B,rD     | multiply (rev 11+ only)         | spr06d=lsb; rD=msb
 
 Branch instructions:
 jmp       | l          | Uncond. jump (virtual instr.)   | PC=l
-jand      | A,B,l      | Jump if binary AND              | if(A&B) PC=l
-jnand     | A,B,l      | Jump if not binary AND          | if(!(A&B)) PC=l
+jand      | A,B,l      | Jump if binary AND is zero      | if(!(A&B)) PC=l
+jnand     | A,B,l      | Jump if binary AND is nonzero   | if(A&B) PC=l
 js        | A,B,l      | Jump if all bits set            | if((A&B)==A) PC=l
 jns       | A,B,l      | Jump if not all bits set        | if((A&B)!=A) PC=l
 je        | A,B,l      | Jump if equal                   | if(A==B) PC=l
