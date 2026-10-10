@@ -109,9 +109,20 @@ not a value tuned to pass, the interpreter has no per-file special-casing.
 Known limitations
 ------------------
 
-`psm.py` run from the real entry point (PC 0) stops at the first wait on the
-hardware: the PHY register interface (SPR 0x018/0x019) and the SPR 0x078
-handshake of the boot, then the main loop's external conditions.
+On its own, `psm.py` run from the real entry point (PC 0) stops at the first
+wait on the hardware: the PHY register interface (SPR 0x018/0x019) and the
+SPR 0x078 handshake of the boot, then the main loop's external conditions.
+`lockstep.py` runs the whole program against a host op stream, with those two
+handshakes modelled and COND_MACEN taken from MACCONTROL; from PC 0 it boots
+both the 0x3A0 and the 0x310 builds to their main loop. Every other
+`jext`/`jnext` condition stays false.
+
+A MAC disable suspends the ucode only when nothing is pending. If the host
+has just written a nonzero word to SHM byte 0x00B8 (0x7148, once in most
+D6220 cold-sweep segments), the 0x3A0 builds copy it to SPR 0x0E7, start the
+TX engine (SPR_TXE0_CTL = 0x4001), set bit 1 of SPR_BRC and go back to the
+main loop to wait for it before suspending. No TX engine is modelled, so
+that suspend never completes here.
 
 `unk_002` (opcode 2 of the control group, beside `nap` 1, `calls` 4 and
 `rets` 5) has no operands and no known meaning; it is executed as a no-op.
@@ -121,6 +132,30 @@ TKIP acceleration (`tkiph`/`tkiphs`/`tkipl`/`tkipls`) is not implemented.
 
 Companion tools
 ---------------
+
+`lockstep.py` co-simulates a host op stream (`test/integration`'s trace, a
+vendor capture, or `reverse-tools/mmio2ops.py` output) with the ucode as one
+machine: the PSM starts at PC 0 on PSM_RUN and runs `--cycles` instructions
+after every host operation, over shared memory and an IHR register file the
+host's MMIO writes reach (SPR n is MMIO 0x400 + 2n). Its report lists every
+assumption it had to make: the external conditions with the value used, the
+SPRs read before anyone wrote them, the PHY registers the ucode read and where
+their value came from.
+
+    ./lockstep.py b43.trace d11ucode42.bin --cond-inc cond.inc
+
+The captures do not contain the initvals: `--initvals` writes them (initvals,
+then bsinitvals) when the ucode first reports MAC_SUSPENDED after PSM_RUN,
+where brcms_b_coreinit writes them. A fixed `--cycles` is too short for the
+boot, which clears shared memory before suspending (about 9700 instructions on
+the 0x3A0 builds): host writes made meanwhile are lost. `--settle MAX` runs
+the ucode until it is idle after each host operation instead, and adds a
+timetable to the report: the instructions the ucode spends on each operation,
+when it raises IRQ bits, and the shared-memory words it writes that the host
+reads later.
+
+    ./lockstep.py cold01-ch36-bw20.txt d11ucode42.bin --settle 200000 \
+        --initvals d11ac1initvals42.bin --initvals d11ac1bsinitvals42.bin
 
 `cond.py` parses OpenFWWF's `cond.inc` (github.com/fullstory/openfwwf) into the
 external-condition map, so the jext/jnext signals the executor stubs can be
