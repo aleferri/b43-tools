@@ -301,6 +301,9 @@ class PSM:
         # Called as observer(loc, old, new) on every state write, loc being
         # ('reg'|'spr'|'shm', index); within step(), pc is still the writer's.
         self.observer = None
+        # Called as on_eoi(selector & 0x7F) after a jext/jnext with bit 7 has
+        # tested the condition, for a hardware model to acknowledge the event.
+        self.on_eoi = None
         # Stall detection based on "highest PC ever reached": robust to loop
         # size (unlike a fixed-window detector).
         self._high_water = 0
@@ -478,8 +481,10 @@ class PSM:
                 note = f"{m} 0x{imm:02X}: COND_TRUE, always true"
                 cond_true = True
             else:
-                # bit 7 only asks for an EOI: the signal is the same
+                # bit 7 asks for an EOI of the same signal once it is tested
                 cond_true = self.ext_flags.get(imm & 0x7F, False)
+                if imm & 0x80 and self.on_eoi:
+                    self.on_eoi(imm & 0x7F)
                 note = f"{m} 0x{imm:02X}: hardware flag not emulated, assuming {cond_true}"
             cond = cond_true if m == "jext" else (not cond_true)
             if cond:
