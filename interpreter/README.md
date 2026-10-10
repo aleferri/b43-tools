@@ -128,6 +128,11 @@ ucode acknowledges it) rather than a known semantic of the corerev 42 TX
 engine; on the D6220 captures its outcome does not depend on the delays
 given to it.
 
+The 0x310 build (DSL-3580_EU) also waits on the TSF before that suspend: at
+0x066C it goes back to the main loop until 8 microseconds have passed since
+the value it saved in SHM word 0x81A. Without a running TSF it never gets
+there; with `--psm-mhz` it sends its frame and suspends.
+
 `unk_002` (opcode 2 of the control group, beside `nap` 1, `calls` 4 and
 `rets` 5) has no operands and no known meaning; it is executed as a no-op.
 
@@ -164,6 +169,38 @@ reads later.
 Condition register 4 follows SPR_BRC bit by bit, as OpenFWWF documents it.
 `--tx-engine IFS,START,DONE` adds the TX engine model described below, with
 its delays in PSM instructions.
+
+The TX engine model starts a frame when the ucode writes SPR 0x320
+(SPR_TX_Serial_Control) with bit 15 set: 0x8001 when it sends a queued frame,
+0x8000 when it sends the beacon (0x0462 on the 0x310 build).
+
+`--psm-mhz F` makes the TSF run: SPR_TSF_WORD0..3 (0x119..0x11C) advance by
+one microsecond every F instructions, as on a PSM running one instruction per
+cycle at F MHz. Neither the clock nor the cycles per instruction of the
+corerev 42 PSM are known, so F is a model parameter, like the TX engine
+delays. Host writes to MMIO 0x632..0x638 or to the 32-bit TSF registers at
+0x180/0x184 set the TSF, and so do ucode writes to those SPRs. A loop that
+reads the TSF is not idle for `--settle`. On D6220's cold01 capture the
+report is the same at 80 and at 200.
+
+With the TSF running, the beacon interval the host programs raises
+COND_TX_TBTTEXPIRE (0x2C) at every TBTT: MMIO 0x188 (tsf_cfprep) holds the
+interval in microseconds shifted left by 6, MMIO 0x18C (tsf_cfpstart) the
+first TBTT, as brcmsmac and b43 program them. An op line `cpuN WAIT
+us=0x...` lets that much time pass; while the ucode is idle the clock jumps
+to the next TBTT.
+
+    cpu0 MAC.MCTRL val=0x04000404
+    cpu0 MAC.MCTRL val=0x04020402
+    cpu0 REG.WR off=0x0188 val=0x00640000
+    cpu0 REG.WR off=0x018c val=0x00019000
+    cpu0 MAC.MCTRL val=0x04020403
+    cpu0 MAC.MCMD val=0x00000003
+    cpu0 WAIT us=0x00060000
+
+With `--settle 300000 --tx-engine 20,10,30 --psm-mhz 80` and the initvals,
+this sends a beacon at each of the three TBTTs on DSL-3580_EU and on D6220,
+raising TBTT_INDI and BEACON_TX_OK each time.
 
 `cond.py` parses OpenFWWF's `cond.inc` (github.com/fullstory/openfwwf) into the
 external-condition map, so the jext/jnext signals the executor stubs can be
