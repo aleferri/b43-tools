@@ -42,8 +42,21 @@ CORECTL  SPR 0x078 (MMIO 0x4F0, brcmsmac's psm_corectlsts): both blobs set
             semantic.
 
 External conditions: COND_TRUE (0x7F) is true, COND_MACEN (0x24) follows
-MACCONTROL.ENABLED, every other jext/jnext selector is False and reported. The selector names are OpenFWWF's
-corerev-5 ones, not verified on corerev 42.
+MACCONTROL.ENABLED, and condition register 4 (0x40..0x4F) is SPR_BRC bit by
+bit, as OpenFWWF documents it ("the NEED_RESPONSEFR bit is set in SPR_BRC.
+This will trigger the condition COND_NEED_RESPONSEFR"). With --tx-engine
+the TX engine raises COND_TX_NOW, COND_TX_POWER and COND_TX_DONE (below).
+Every other jext/jnext selector is False and reported. The selector names
+are OpenFWWF's corerev-5 ones, not verified on corerev 42.
+
+TX engine (--tx-engine IFS,START,DONE, in PSM instructions): a model of
+OpenFWWF's transmit sequence, not a known semantic. Setting bit 0 of
+SPR_TXE0_CTL (0x080) raises COND_TX_NOW after IFS instructions; a write of
+SPR 0x320 with bits 15 and 0 set, which the 0x3A0 builds make once a frame
+is set up, raises COND_TX_POWER after START and COND_TX_DONE after DONE.
+Each stays raised until the ucode acknowledges it with an EOI jext/jnext.
+Without it no frame ever completes, and neither does a MAC suspend that
+waits for one.
 
 The host's reads come from its own trace (the oracle the trace was made
 with), so the ucode does not feed back into the host here: what this measures
@@ -82,6 +95,10 @@ EXT_IHR_GO, EXT_IHR_READ = 0x4000, 0x2000
 SPR_CORECTL, CORECTL_REQ, CORECTL_ACK = 0x078, 0x0020, 0x2000
 MMIO_PHY_VER = 0x3E0
 COND_MACEN = 0x24
+COND_TX_NOW, COND_TX_POWER, COND_TX_DONE = 0x20, 0x21, 0x22
+CONDREG_BRC = 0x40              # condition register 4 mirrors SPR_BRC
+SPR_BRC, SPR_TXE0_CTL, SPR_TXE_CMD = 0x048, 0x080, 0x320
+TXE_CMD_GO = 0x8001
 IRQ_MAC_SUSPENDED = 0x0001
 HOSTF_WORDS = (0x05E >> 1, 0x060 >> 1, 0x062 >> 1, 0x078 >> 1, 0x0D4 >> 1)
 OBJADDR, OBJDATA, OBJDATA_HI = 0x160, 0x164, 0x166
@@ -110,11 +127,16 @@ def load_inits(path):
 
 
 class Lockstep:
-    def __init__(self, prog, cycles, settle=None, inits=None):
+    def __init__(self, prog, cycles, settle=None, inits=None, tx=None):
         self.prog = prog
         self.m = psm.PSM(prog)
         self.m.stall_threshold = float("inf")
         self.m.observer = self.observe
+        self.m.on_eoi = self.eoi
+        self.tx = tx                    # (ifs, start, done) or None
+        self.events = set()             # raised TX conditions
+        self.pending = []               # (step, condition) still to raise
+        self.tx_log = []                # (op_id, offset, condition)
         self.cycles = cycles
         self.settle_max = settle
         self.inits = inits or []
@@ -231,9 +253,38 @@ class Lockstep:
         return True
 
     # ---- ucode side ----
+    def eoi(self, sel):
+        self.events.discard(sel)
+
+    def tx_schedule(self, loc, old, new):
+        ifs, start, done = self.tx
+        if loc == ("spr", SPR_TXE0_CTL) and new & 1 and not old & 1:
+            self.pending.append((self.steps + ifs, COND_TX_NOW))
+        elif loc == ("spr", SPR_TXE_CMD) and new & TXE_CMD_GO == TXE_CMD_GO:
+            self.pending.append((self.steps + start, COND_TX_POWER))
+            self.pending.append((self.steps + done, COND_TX_DONE))
+
+    def conditions(self):
+        m = self.m
+        flags = {COND_MACEN: bool(self.macctl & MACCTL_ENABLED)}
+        brc = m.spr.get(SPR_BRC, 0)
+        for bit in range(16):
+            flags[CONDREG_BRC | bit] = bool(brc >> bit & 1)
+        if self.pending:
+            due = [p for p in self.pending if p[0] <= self.steps]
+            for p in due:
+                self.pending.remove(p)
+                self.events.add(p[1])
+                self.tx_log.append((self.op_id, self.steps - self.op_start, p[1]))
+        for sel in self.events:
+            flags[sel] = True
+        m.ext_flags = flags
+
     def observe(self, loc, old, new):
         offset = self.steps - self.op_start
         kind, n = loc
+        if self.tx and kind == "spr":
+            self.tx_schedule(loc, old, new)
         if kind == "spr" and n in (SPR_IRQ_LO, SPR_IRQ_HI):
             self.irqs.append((self.op_id, self.op_desc, offset, n, new))
             if n == SPR_IRQ_LO and new & IRQ_MAC_SUSPENDED and self.inits_state == "wait":
@@ -253,6 +304,7 @@ class Lockstep:
             self.running = False
             return False
         ins = prog[pc]
+        self.conditions()
         self.pcs[pc] += 1
         for op in (ins.op0, ins.op1):
             if op is not None and op.kind == "spr" and \
@@ -283,7 +335,6 @@ class Lockstep:
         return True
 
     def run(self, n):
-        self.m.ext_flags = {COND_MACEN: bool(self.macctl & MACCTL_ENABLED)}
         for _ in range(n):
             if not self.step():
                 return
@@ -292,14 +343,14 @@ class Lockstep:
         """Run until idle; return (steps until the idle cycle began, its pc),
         the pc being None if --settle ran out first."""
         m = self.m
-        m.ext_flags = {COND_MACEN: bool(self.macctl & MACCTL_ENABLED)}
         start, self.changes, seen, epoch = self.steps, [], {}, self.host_epoch
         while self.running and self.steps - start < self.settle_max:
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
-            key = (m.pc, tuple(m.call_stack), m.spr.get("__carry__", 0))
+            key = (m.pc, tuple(m.call_stack), m.spr.get("__carry__", 0),
+                   tuple(sorted(self.events)))
             prev = seen.get(key)
-            if prev is not None and self.unchanged_since(prev[1]):
+            if prev is not None and not self.pending and self.unchanged_since(prev[1]):
                 return prev[0] - start, m.pc
             seen[key] = (self.steps, len(self.changes))
             if not self.step():
@@ -391,6 +442,10 @@ class Lockstep:
         for op_id, desc, steps, pc in self.reactions:
             idle = f"{pc:#06x} {self.describe(pc)}" if pc is not None else "not idle"
             w(f"  #{op_id:<8d} {steps:>7d}  {idle:24s} {desc[:60]}\n")
+        if self.tx:
+            w(" TX engine conditions raised (op, +steps, condition):\n")
+            for op_id, off, sel in self.tx_log:
+                w(f"  #{op_id:<8d} +{off:<7d} 0x{sel:02X} {label(sel)}\n")
         w(" IRQ bits the ucode raised (op, +steps, register, bits):\n")
         for op_id, desc, off, n, bits in self.irqs:
             w(f"  #{op_id:<8d} +{off:<7d} spr{n:03X} {bits:#06x}  {desc[:50]}\n")
@@ -421,6 +476,8 @@ def main():
     ap.add_argument("--initvals", action="append", default=[],
                     help="d11init blob, written after the boot self-suspend "
                          "(repeatable: initvals, then bsinitvals)")
+    ap.add_argument("--tx-engine", metavar="IFS,START,DONE",
+                    help="model the TX engine with these delays, in PSM instructions")
     ap.add_argument("--report")
     ap.add_argument("--cond-inc", help="OpenFWWF cond.inc, to name the selectors")
     args = ap.parse_args()
@@ -432,7 +489,8 @@ def main():
         label = cm.label
 
     inits = [e for p in args.initvals for e in load_inits(p)]
-    ls = Lockstep(psm.load_program(args.blob), args.cycles, args.settle, inits)
+    tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
+    ls = Lockstep(psm.load_program(args.blob), args.cycles, args.settle, inits, tx)
     ls.feed(args.ops)
     out = open(args.report, "w") if args.report else sys.stdout
     ls.report(out, label)
