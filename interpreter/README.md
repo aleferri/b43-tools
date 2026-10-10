@@ -121,8 +121,12 @@ A MAC disable suspends the ucode only when nothing is pending. If the host
 has just written a nonzero word to SHM byte 0x00B8 (0x7148, once in most
 D6220 cold-sweep segments), the 0x3A0 builds copy it to SPR 0x0E7, start the
 TX engine (SPR_TXE0_CTL = 0x4001), set bit 1 of SPR_BRC and go back to the
-main loop to wait for it before suspending. No TX engine is modelled, so
-that suspend never completes here.
+main loop to send a frame before suspending. That suspend completes only
+with `lockstep.py --tx-engine`, a model of OpenFWWF's transmit sequence
+(COND_TX_NOW, then COND_TX_POWER and COND_TX_DONE, each held until the
+ucode acknowledges it) rather than a known semantic of the corerev 42 TX
+engine; on the D6220 captures its outcome does not depend on the delays
+given to it.
 
 `unk_002` (opcode 2 of the control group, beside `nap` 1, `calls` 4 and
 `rets` 5) has no operands and no known meaning; it is executed as a no-op.
@@ -156,6 +160,10 @@ reads later.
 
     ./lockstep.py cold01-ch36-bw20.txt d11ucode42.bin --settle 200000 \
         --initvals d11ac1initvals42.bin --initvals d11ac1bsinitvals42.bin
+
+Condition register 4 follows SPR_BRC bit by bit, as OpenFWWF documents it.
+`--tx-engine IFS,START,DONE` adds the TX engine model described below, with
+its delays in PSM instructions.
 
 `cond.py` parses OpenFWWF's `cond.inc` (github.com/fullstory/openfwwf) into the
 external-condition map, so the jext/jnext signals the executor stubs can be
