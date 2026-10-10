@@ -188,7 +188,9 @@ COND_TX_TBTTEXPIRE (0x2C) at every TBTT: MMIO 0x188 (tsf_cfprep) holds the
 interval in microseconds shifted left by 6, MMIO 0x18C (tsf_cfpstart) the
 first TBTT, as brcmsmac and b43 program them. An op line `cpuN WAIT
 us=0x...` lets that much time pass; while the ucode is idle the clock jumps
-to the next TBTT.
+to the next TBTT. Raising one condition at a time on an idle, enabled ucode
+(`condfuzz.py`) finds 0x2C as the only one that reaches the beacon block on
+both families, through bit 12 of SPR_BRC.
 
     cpu0 MAC.MCTRL val=0x04000404
     cpu0 MAC.MCTRL val=0x04020402
@@ -214,6 +216,16 @@ with `COND_RX_COMPLETE` forced the ucode enters its RX handler where unseeded it
 idles. The names are OpenFWWF's corerev-5 (arch5) names; the selector layout and
 `COND_TRUE=0x7F` carry over to the arch15 cores, but a given FIXME bit is a lead
 for a newer core, not a guarantee.
+
+`condfuzz.py` brings the co-simulation to a state with an op stream, then
+raises each condition in turn (on top of any given with `--with`) and lists
+those that lead the ucode to a target address, or with `--blocking` those
+that keep it away. Conditions stay raised until the ucode acknowledges them,
+where hardware may drop them sooner: a hit is a lead to read in the listing.
+
+    ./condfuzz.py idle.ops d11ucode42.bin 0x016B --psm-mhz 80 \
+        --tx-engine 20,10,30 --initvals d11ac1initvals42.bin \
+        --initvals d11ac1bsinitvals42.bin
 
 `ucode_init.py` runs just the version-stamp prologue and dumps the shared
 memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
