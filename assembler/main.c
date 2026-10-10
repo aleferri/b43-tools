@@ -652,7 +652,7 @@ static void emulate_jmp_insn(struct assembler_context *ctx,
 
 static void emulate_jand_insn(struct assembler_context *ctx,
 			      struct instruction *insn,
-			      int inverted)
+			      int nonzero)
 {
 	struct code_output *out;
 	struct instruction em_insn;
@@ -693,10 +693,10 @@ static void emulate_jand_insn(struct assembler_context *ctx,
 			first_bit = ffs(tmp);
 			last_bit = ffs(~(tmp >> (first_bit - 1))) - 1 + first_bit - 1;
 
-			if (inverted)
-				em_insn.op = OP_JZX;
-			else
+			if (nonzero)
 				em_insn.op = OP_JNZX;
+			else
+				em_insn.op = OP_JZX;
 			em_op_shift.type = OPER_RAW;
 			em_op_shift.u.raw = first_bit - 1;
 			em_op_mask.type = OPER_RAW;
@@ -723,7 +723,7 @@ static void emulate_jand_insn(struct assembler_context *ctx,
 	}
 
 	/* Do a normal JAND/JNAND instruction */
-	if (inverted)
+	if (nonzero)
 		out = do_assemble_insn(ctx, insn, 0x040 | 0x1);
 	else
 		out = do_assemble_insn(ctx, insn, 0x040);
