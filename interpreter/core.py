@@ -19,6 +19,7 @@ the others (STATUS.md).
               interface, named after the device behind it
   handshakes  SPR bits the ucode sets and waits on, answered at once
   tx_go       the SPR write that launches a prepared frame
+  host_regs   IHR registers that answer host accesses on their own
 
 A revision without a ucode of its own gets the profile of its generation,
 marked as assumed.
@@ -79,6 +80,32 @@ class SprSelfClear:
 
 
 @dataclass(frozen=True)
+class HostTaken:
+    """Bits of a host write the hardware takes at once: never read back."""
+    spr: int
+    bits: int
+
+    def after_write(self, value):
+        return value & ~self.bits
+
+    def after_read(self, value):
+        return value
+
+
+@dataclass(frozen=True)
+class HostBusy:
+    """Bits of a host write still set at the first read after it, then clear."""
+    spr: int
+    bits: int
+
+    def after_write(self, value):
+        return value
+
+    def after_read(self, value):
+        return value & ~self.bits
+
+
+@dataclass(frozen=True)
 class SprTrigger:
     spr: int
     bits: int
@@ -92,6 +119,7 @@ class Core:
     handshakes: tuple
     tx_go: SprTrigger
     read_from: tuple        # corerevs whose ucode this profile was read from
+    host_regs: tuple = ()
     assumed: bool = False
 
 
@@ -115,6 +143,10 @@ TX_TEMPLATE = SprTrigger(spr=0x0B4, bits=0x0826)
 # From corerev 40: 0x8001 for a queued frame, 0x8000 for the beacon.
 TX_SERIAL = SprTrigger(spr=0x320, bits=0x8000)
 
+# TX FIFO setup on corerev 42, as the stock driver's bus capture shows it.
+XMTFIFOCMD_BUSY = HostBusy(spr=0x0A0, bits=0x0001)
+AGGFIFODATA0_GO = HostTaken(spr=0x098, bits=0x8000)
+
 _PROFILES = (
     ((5, 14), Core(corerev=5, isa=psm5, buses=(PHY_D11,),
                    handshakes=(RXE_SUSPEND,), tx_go=TX_TEMPLATE,
@@ -124,7 +156,8 @@ _PROFILES = (
                     read_from=(16, 22, 24, 26, 29, 30))),
     ((40, None), Core(corerev=42, isa=psm15, buses=(PHY_GO, RADIO),
                       handshakes=(RXE_SUSPEND, CORECTL), tx_go=TX_SERIAL,
-                      read_from=(40, 42))),
+                      read_from=(40, 42),
+                      host_regs=(XMTFIFOCMD_BUSY, AGGFIFODATA0_GO))),
 )
 
 
