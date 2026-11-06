@@ -180,6 +180,18 @@ A tool skips the classes it does not use.
 hardware around it, built from the `core.py` profile of a core revision and
 from PHY and radio devices. Its docstring describes what it models.
 
+`vchipd.py` serves the chip to a driver over stdin/stdout: the driver
+forwards the D11 core's MMIO and the passing of time, the chip answers the
+reads and says when an interrupt is pending. The board is given by options
+(core revision, PHY version word, the radio's identity registers):
+
+    ./vchipd.py --corerev 42 --phy-ver 0x0b01 --radio 0=0x4 --radio 1=0x2069
+
+    W <off> <val> <bits>    an MMIO write            -> K <irq>
+    R <off> <bits>          an MMIO read             -> V <val> <irq>
+    T <us>                  time passes              -> K <irq>
+    Q                       end                      -> K <irq>
+
 `lockstep.py` co-simulates a host op stream with the ucode as one machine:
 the PSM starts at PC 0 on PSM_RUN and runs `--cycles` instructions after
 every host operation, over shared memory and an IHR register file the
