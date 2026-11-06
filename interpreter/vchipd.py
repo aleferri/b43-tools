@@ -27,11 +27,13 @@ knows when to run the interrupt handler. Before every access --access-us
 microseconds pass, so that the ucode runs between them.
 
 The board is what the options say: the core revision, the PHY version word
-(MMIO PHY_VER, and PHY register 0 as the ucode reads it), and the radio's
-registers that hold its identity (--radio 0=0x4 --radio 1=0x2069 for a radio
-2069 rev 4 read the way b43 reads it on corerev 40/42).
+(MMIO PHY_VER, and PHY register 0 as the ucode reads it), and PHY and radio
+registers as the chip starts with them (--phy 0xb=0x2bdb for a 3-core AC-PHY,
+--radio 0=0x4 --radio 1=0x2069 for a radio 2069 rev 4 as b43 reads it on
+corerev 40/42).
 
-    vchipd.py --corerev N --phy-ver V [--radio REG=VAL ...] [--psm-mhz F]
+    vchipd.py --corerev N --phy-ver V [--phy REG=VAL ...] [--radio REG=VAL ...]
+              [--psm-mhz F]
               [--access-us U] [--tx-engine IFS,START,DONE] [--report FILE]
 """
 
@@ -42,7 +44,7 @@ import core
 import vchip
 
 
-def board_radio(pairs):
+def board_regs(pairs):
     regs = {}
     for pair in pairs:
         reg, val = pair.split("=")
@@ -99,8 +101,10 @@ def main():
     ap.add_argument("--corerev", type=int, required=True)
     ap.add_argument("--phy-ver", type=lambda x: int(x, 0), required=True,
                     help="MMIO PHY_VER: analog << 12 | type << 8 | revision")
+    ap.add_argument("--phy", action="append", default=[], metavar="REG=VAL",
+                    help="a PHY register as the chip starts with it")
     ap.add_argument("--radio", action="append", default=[], metavar="REG=VAL",
-                    help="a radio register as the chip starts with it (identity)")
+                    help="a radio register as the chip starts with it")
     ap.add_argument("--psm-mhz", type=float, default=80.0,
                     help="PSM instructions per microsecond, a model (default 80)")
     ap.add_argument("--access-us", type=float, default=0.1,
@@ -111,7 +115,8 @@ def main():
 
     hw = core.for_corerev(args.corerev)
     tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
-    devices = {"radio": vchip.RegisterFile("radio", board_radio(args.radio))}
+    devices = {"phy": vchip.RegisterFile("phy", board_regs(args.phy)),
+               "radio": vchip.RegisterFile("radio", board_regs(args.radio))}
     chip = vchip.Chip([], hw, devices, tx=tx, mhz=args.psm_mhz, phy_version=args.phy_ver)
     serve(chip, args.access_us, sys.stdin, sys.stdout)
     if args.report:
