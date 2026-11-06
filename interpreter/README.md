@@ -282,6 +282,13 @@ where hardware may drop them sooner: a hit is a lead to read in the listing.
         --tx-engine 20,10,30 --initvals d11ac1initvals42.bin \
         --initvals d11ac1bsinitvals42.bin
 
+`fwmatrix.py` runs every ucode of a `b43-fwcutter` output directory: the
+decoder against `b43-dasm`, then a boot and a beacon interval in
+`lockstep.py` with the profile of the ucode's corerev and the initvals of its
+PHY. STATUS.md has its results on the DSL-3580_EU driver.
+
+    ./fwmatrix.py fw/b43 --dasm ../disassembler/b43-dasm
+
 `ucode_init.py` runs just the version-stamp prologue and dumps the shared
 memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
 `cond.py`, the jext/jnext conditions a blob tests:
