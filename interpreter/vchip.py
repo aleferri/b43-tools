@@ -31,7 +31,7 @@ Host MMIO, as b43 uses it:
   0x124/0x128/0x12C  MACCMD, GEN_IRQ_REASON (write 1 to clear), IRQ mask:
                      SPR 0x047, 0x042/0x043, 0x044/0x045.
   0x180/0x184        TSF; 0x188/0x18C beacon interval (us << 6) and first TBTT.
-  0x400 + 2n         SPR n.
+  0x400 + 2n         SPR n; the profile's host_regs act on host accesses.
 Any other register reads back what was written; reads of it are counted.
 
 Initvals go through the MMIO when the ucode first raises MAC_SUSPENDED after
@@ -210,6 +210,7 @@ class Chip:
         self.mmio = {}                  # registers without a meaning here
         self.unmodelled = {}            # offset -> reads of them
         self.quiet = False              # idle, and no host write since
+        self.host_regs = {hr.spr: hr for hr in hw.host_regs}
         self.host_spr = set()           # SPRs the host has written
         self.host_epoch = 0             # bumped by host writes made during a run
         self.stopped = None             # exception that stopped the PSM
@@ -239,7 +240,8 @@ class Chip:
                     self.tsf_set_word(k - SPR_TSF_WORD0, part)
                     self.host_spr.add(k)
                 else:
-                    self.spr_write(k, part)
+                    hr = self.host_regs.get(k)
+                    self.spr_write(k, hr.after_write(part) if hr else part)
         elif off == MACCMD:
             self.spr_write(SPR_MAC_CMD, val)
         elif off == IRQ_REASON:
@@ -358,7 +360,13 @@ class Chip:
             if self.mhz and (n in TSF_SPRS or n + 1 in TSF_SPRS):
                 self.tsf_publish()
             val = spr.get(n, 0)
-            return val | spr.get(n + 1, 0) << 16 if bits == 32 else val
+            if bits == 32:
+                val |= spr.get(n + 1, 0) << 16
+            for k in (n, n + 1)[:2 if bits == 32 else 1]:
+                hr = self.host_regs.get(k)
+                if hr:
+                    spr[k] = hr.after_read(spr.get(k, 0))
+            return val
         self.unmodelled[off] = self.unmodelled.get(off, 0) + 1
         return self.mmio.get(off, 0)
 
