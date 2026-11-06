@@ -272,6 +272,16 @@ idles. The names are OpenFWWF's corerev-5 (arch5) names; the selector layout and
 `COND_TRUE=0x7F` carry over to the arch15 cores, but a given bit is a lead for
 a newer core, not a guarantee.
 
+`condfuzz.py` brings the co-simulation to a state with an op stream, then
+raises each condition in turn (on top of any given with `--with`) and lists
+those that lead the ucode to a target address, or with `--blocking` those
+that keep it away. Conditions stay raised until the ucode acknowledges them,
+where hardware may drop them sooner: a hit is a lead to read in the listing.
+
+    ./condfuzz.py idle.ops d11ucode42.bin 0x016B --psm-mhz 80 \
+        --tx-engine 20,10,30 --initvals d11ac1initvals42.bin \
+        --initvals d11ac1bsinitvals42.bin
+
 `ucode_init.py` runs just the version-stamp prologue and dumps the shared
 memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
 `cond.py`, the jext/jnext conditions a blob tests:
