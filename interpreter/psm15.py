@@ -101,6 +101,8 @@ def load_program(path: str) -> list[Instr]:
 
 
 class PSM(psmlib.PSM):
+    ISA_MNEMS = frozenset(("calls", "rets"))
+
     def execute_isa(self, instr):
         if instr.mnem == "calls":
             self.call_stack.append(self.pc + 1)

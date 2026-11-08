@@ -200,6 +200,7 @@ class Chip:
         if phy_version is not None:
             self.phy.seed(0, phy_version)
         self.recorder = recorder or Recorder()
+        self.recording = type(self.recorder) is not Recorder
         self.m = hw.isa.PSM(prog)
         self.m.stall_threshold = float("inf")
         self.m.observer = self.observe
@@ -228,16 +229,23 @@ class Chip:
         self.unmodelled = {}            # offset -> reads of them
         self.quiet = False              # idle, and no host write since
         self.skip_time_waits = skip_time_waits
+        self.watched = {bus.addr_spr for bus in hw.buses} | {hs.spr for hs in hw.handshakes}
+        self.hw_dirty = False           # a watched SPR was written
+        self.prog_info = None
         self.host_regs = {hr.spr: hr for hr in hw.host_regs}
         self.host_spr = set()           # SPRs the host has written
         self.host_epoch = 0             # bumped by host writes made during a run
         self.stopped = None             # exception that stopped the PSM
         self.steps = 0
         self.changes = []               # (loc, old) of state changes in this settle
+        self.state_hash = 0             # xor of hash((loc, value)) over ucode writes
+        self.flags_key = None
 
     def spr_write(self, n, val):
         self.m.spr[n] = val & 0xFFFF
         self.host_spr.add(n)
+        if n in self.watched:
+            self.hw_dirty = True
 
     def host_reg_write(self, off, val, bits):
         """The effect of a host MMIO write on the MAC registers, the TSF and
@@ -459,6 +467,7 @@ class Chip:
                 break
             prog.append(isa.decode_instr(codeword, i))
         self.prog = self.m.prog = prog
+        self.prog_info = None
         self.ucode_dirty = False
 
     def snapshot(self):
@@ -512,12 +521,23 @@ class Chip:
             self.pending.append((self.steps + done, COND_TX_DONE))
 
     def conditions(self):
-        m = self.m
+        """The external conditions, for a jext/jnext."""
+        brc = self.m.spr.get(SPR_BRC, 0)
+        key = (self.macctl & MACCTL_ENABLED, brc, tuple(sorted(self.events)) if self.events else ())
+        if key == self.flags_key:
+            return
+        self.flags_key = key
         flags = {COND_MACEN: bool(self.macctl & MACCTL_ENABLED)}
-        brc = m.spr.get(SPR_BRC, 0)
         for bit in range(16):
             flags[CONDREG_BRC | bit] = bool(brc >> bit & 1)
-        if self.mhz and self.next_tbtt is not None and self.tsf() >= self.next_tbtt:
+        for sel in self.events:
+            flags[sel] = True
+        self.m.ext_flags = flags
+
+    def raise_events(self):
+        """The TBTT and TX engine conditions that came due."""
+        if self.next_tbtt is not None and self.mhz and \
+                self.tsf_base + int((self.clock - self.tsf_clock) / self.mhz) >= self.next_tbtt:
             self.events.add(COND_TBTT)
             self.recorder.tbtt(self.next_tbtt)
             if self.tbtt_us:
@@ -530,9 +550,6 @@ class Chip:
                 self.pending.remove(p)
                 self.events.add(p[1])
                 self.recorder.tx_condition(p[1])
-        for sel in self.events:
-            flags[sel] = True
-        m.ext_flags = flags
 
     def observe(self, loc, old, new):
         kind, n = loc
@@ -550,9 +567,13 @@ class Chip:
         if kind == "spr" and n == SPR_IRQ_LO and new & IRQ_MAC_SUSPENDED \
                 and self.inits_state == "wait":
             self.inits_state = "due"
-        self.recorder.store(loc, old, new)
+        if kind == "spr" and n in self.watched:
+            self.hw_dirty = True
+        if self.recording:
+            self.recorder.store(loc, old, new)
         if final != old:
             self.changes.append((loc, old))
+            self.state_hash ^= hash((loc, old)) ^ hash((loc, final))
 
     def step(self):
         """One ucode instruction plus the hardware the model answers for it.
@@ -564,17 +585,20 @@ class Chip:
             self.running = False
             return False
         ins = prog[pc]
-        if self.mhz:
+        if self.prog_info is None:
+            self.prog_info = [self.instruction_info(i) for i in prog]
+        reads_tsf, sprs, is_ext = self.prog_info[pc]
+        self.raise_events()
+        if reads_tsf and self.mhz:
             self.tsf_publish()
-        self.conditions()
-        for op in (ins.op0, ins.op1):
-            if op is None or op.kind != "spr":
-                continue
-            if self.mhz and op.value in TSF_SPRS:
-                self.clock_read_at = self.tsf_read_at = self.steps
-            elif op.value not in m.spr and op.value not in self.host_spr:
-                self.recorder.unset_spr_read(op.value, pc)
-        self.recorder.step(pc, ins, m.ext_flags)
+            self.clock_read_at = self.tsf_read_at = self.steps
+        if is_ext:
+            self.conditions()
+        if self.recording:
+            for spr in sprs:
+                if spr not in m.spr and spr not in self.host_spr:
+                    self.recorder.unset_spr_read(spr, pc)
+            self.recorder.step(pc, ins, m.ext_flags)
         try:
             m.step()
         except Exception as e:      # noqa: BLE001
@@ -583,19 +607,28 @@ class Chip:
             return False
         self.steps += 1
         self.clock += 1
-        for bus in self.hw.buses:
-            cmd = m.spr.get(bus.addr_spr, 0)
-            kind = bus.command.command(cmd)
-            if kind:
-                self.transfer(bus, cmd, kind)
-        for hs in self.hw.handshakes:
-            value = m.spr.get(hs.spr, 0)
-            answer = hs.respond(value)
-            if answer != value:
-                m.store(("spr", hs.spr), answer)
+        if self.hw_dirty:
+            self.hw_dirty = False
+            for bus in self.hw.buses:
+                cmd = m.spr.get(bus.addr_spr, 0)
+                kind = bus.command.command(cmd)
+                if kind:
+                    self.transfer(bus, cmd, kind)
+            for hs in self.hw.handshakes:
+                value = m.spr.get(hs.spr, 0)
+                answer = hs.respond(value)
+                if answer != value:
+                    m.store(("spr", hs.spr), answer)
         if self.inits_state == "due":
             self.write_inits()
         return True
+
+    def instruction_info(self, ins):
+        """(reads the TSF, other SPRs it reads, is a jext/jnext)."""
+        sprs = [op.value for op in (ins.op0, ins.op1) if op is not None and op.kind == "spr"]
+        tsf = self.mhz and any(s in TSF_SPRS for s in sprs)
+        others = tuple(s for s in sprs if not (self.mhz and s in TSF_SPRS))
+        return tsf, others, ins.mnem in ("jext", "jnext")
 
     def transfer(self, bus, cmd, kind):
         m = self.m
@@ -611,7 +644,8 @@ class Chip:
             src = "ucode"
             val = m.spr.get(bus.data_spr, 0)
             dev.write(addr, val)
-        self.recorder.bus(bus.name, kind, addr, val, src)
+        if self.recording:
+            self.recorder.bus(bus.name, kind, addr, val, src)
         m.store(("spr", bus.addr_spr), bus.command.complete(cmd))
 
     def run(self, n):
@@ -632,9 +666,11 @@ class Chip:
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
             key = (m.pc, tuple(m.call_stack), m.carry,
-                   tuple(sorted(self.events)))
+                   tuple(sorted(self.events)) if self.events else ())
             prev = seen.get(key)
-            if prev is not None and not self.pending and self.unchanged_since(prev[1]):
+            if prev is not None and not self.pending and \
+                    (len(self.changes) == prev[1] or
+                     self.state_hash == prev[2] and self.unchanged_since(prev[1])):
                 if self.clock_read_at < prev[0]:
                     return prev[0] - start, m.pc
                 if self.skip_time_waits:
@@ -645,7 +681,7 @@ class Chip:
                         self.clock = wake
                         seen = {}
                         continue
-            seen[key] = (self.steps, len(self.changes))
+            seen[key] = (self.steps, len(self.changes), self.state_hash)
             if not self.step():
                 break
         return self.steps - start, None
