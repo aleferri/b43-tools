@@ -93,6 +93,8 @@ def load_program(path: str) -> list[Instr]:
 
 
 class PSM(psmlib.PSM):
+    ISA_MNEMS = frozenset(("call", "ret"))
+
     def execute_isa(self, instr):
         if instr.mnem == "call":
             lr = instr.extra['lr']

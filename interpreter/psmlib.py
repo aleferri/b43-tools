@@ -377,165 +377,29 @@ class PSM:
         return None
 
     # ---- single step ----
+    # Mnemonics an instruction-set module executes in execute_isa().
+    ISA_MNEMS = frozenset()
+
     def step(self):
         if self.pc >= len(self.prog):
             raise HaltExecution("PC out of program bounds")
         instr = self.prog[self.pc]
         m = instr.mnem
-        confidence = "HIGH"
-        note = ""
-        next_pc = self.pc + 1
-        isa = self.execute_isa(instr)
-
+        confidence = note = None
+        isa = self.execute_isa(instr) if m in self.ISA_MNEMS else None
         if isa is not None:
             next_pc, confidence, note = isa
-        elif m in ("add", "add.", "addc", "addc."):
-            # b43-asm: the "c" forms add the carry, the "." forms set it
-            r = (self.read(instr.op0) & 0xFFFF) + (self.read(instr.op1) & 0xFFFF)
-            if m.startswith("addc"):
-                r += self.carry
-            if m.endswith("."):
-                self.carry = int(r > 0xFFFF)
-            self.write(instr.op2, r)
-        elif m in ("sub", "sub.", "subc", "subc."):
-            r = (self.read(instr.op0) & 0xFFFF) - (self.read(instr.op1) & 0xFFFF)
-            if m.startswith("subc"):
-                r -= self.carry
-            if m.endswith("."):
-                self.carry = int(r < 0)
-            self.write(instr.op2, r)
-        elif m == "mul":
-            # b43-asm: spr06d = low half of the product, rD = high half
-            r = (self.read(instr.op0) & 0xFFFF) * (self.read(instr.op1) & 0xFFFF)
-            self.store(('spr', 0x06D), r & 0xFFFF)
-            self.write(instr.op2, r >> 16)
-        elif m == "and":
-            self.write(instr.op2, self.read(instr.op0) & self.read(instr.op1))
-        elif m == "or":
-            self.write(instr.op2, self.read(instr.op0) | self.read(instr.op1))
-        elif m == "xor":
-            self.write(instr.op2, self.read(instr.op0) ^ self.read(instr.op1))
-        elif m == "nand":
-            # b43-asm: clear the bits of B in A
-            self.write(instr.op2, self.read(instr.op0) & ~self.read(instr.op1))
-        elif m == "sr":
-            self.write(instr.op2, (self.read(instr.op0) & 0xFFFF) >> (self.read(instr.op1) & 0x1F))
-        elif m == "sl":
-            self.write(instr.op2, self.read(instr.op0) << (self.read(instr.op1) & 0x1F))
-        elif m == "sra":
-            v = self.read(instr.op0) & 0xFFFF
-            sh = self.read(instr.op1) & 0x1F
-            if v & 0x8000:
-                v -= 0x10000
-            self.write(instr.op2, v >> sh)
-        elif m in ("rl", "rr"):
-            # BEST-EFFORT: 16-bit rotation (consistent with a 16-bit SHM
-            # word); whether the real width is 16 or 32 bit is unverified.
-            confidence = "BEST-EFFORT"
-            note = "rotation width (16 vs 32 bit) unverified"
-            v = self.read(instr.op0) & 0xFFFF
-            sh = self.read(instr.op1) & 0xF
-            if m == "rl":
-                v = ((v << sh) | (v >> (16 - sh))) & 0xFFFF if sh else v
-            else:
-                v = ((v >> sh) | (v << (16 - sh))) & 0xFFFF if sh else v
-            self.write(instr.op2, v)
-        elif m == "orx":
-            # orx M,S,A,B: A rotated left by S, M+1 bits of it at S over B
-            a, b = instr.extra['a'], instr.extra['b']
-            note = self.hw_checked(instr)
-            if not note:
-                confidence = "BEST-EFFORT"
-                note = f"orx M={a},S={b}: not checked against hardware in this form"
-            x = self.read(instr.op0) & 0xFFFF
-            rot = ((x << b) | (x >> (16 - b))) & 0xFFFF if b else x
-            mask = (((1 << (a + 1)) - 1) << b) & 0xFFFF
-            r = (rot & mask) | (self.read(instr.op1) & ~mask & 0xFFFF)
-            self.write(instr.op2, r)
-        elif m == "srx":
-            a, b = instr.extra['a'], instr.extra['b']
-            # srx M,S,A,B: M+1 bits at S of B:A (B the high word)
-            confidence = "BEST-EFFORT"
-            note = f"srx M={a},S={b}: shift right over two registers, not checked on hardware"
-            v = ((self.read(instr.op1) & 0xFFFF) << 16) | (self.read(instr.op0) & 0xFFFF)
-            r = (v >> b) & ((1 << (a + 1)) - 1)
-            self.write(instr.op2, r)
-        elif m == "nap":
-            pass  # no-op
-        elif m in ("jzx", "jnzx"):
-            confidence = "HIGH"
-            a, b = instr.extra['a'], instr.extra['b']
-            # jzx/jnzx M,S,SRC,Y,LABEL: per assembler/main.c's emulate_jand_insn()
-            # -- the actual generator of "jand REG,0xMASK,LABEL" once 0xMASK is
-            # too wide for a plain JAND immediate. first_bit/last_bit come from
-            # the contiguous-bitmask scan; M = last_bit-first_bit (width-1),
-            # S = first_bit-1 (0-indexed position). SRC is oper[2] -- whichever
-            # of the original two JAND operands was NOT the immediate mask.
-            # Y (-> op1 here) is always a dummy immediate (em_imm.imm = 0):
-            #     em_ol.oper[3] = &em_op_y;
-            # it is never read or combined with SRC. So this tests (M+1) bits
-            # of op0 ALONE, starting at bit S -- not a 32-bit op0:op1 pair.
-            note = f"{m} width={a+1},pos={b}: testing bits [{b+a}:{b}] of op0 alone"
-            v = self.read(instr.op0)
-            field = (v >> b) & ((1 << (a + 1)) - 1)
-            cond = (field == 0) if m == "jzx" else (field != 0)
-            if cond:
-                next_pc = instr.extra['label']
-        elif m in ("jext", "jnext"):
-            confidence = "STUB"
-            imm = instr.extra['imm']
-            if (imm & 0x7F) == COND_TRUE:
-                confidence = "HIGH CONFIDENCE"
-                note = f"{m} 0x{imm:02X}: COND_TRUE, always true"
-                cond_true = True
-            else:
-                # bit 7 asks for an EOI of the same signal once it is tested
-                cond_true = self.ext_flags.get(imm & 0x7F, False)
-                if imm & 0x80 and self.on_eoi:
-                    self.on_eoi(imm & 0x7F)
-                note = f"{m} 0x{imm:02X}: hardware flag not emulated, assuming {cond_true}"
-            cond = cond_true if m == "jext" else (not cond_true)
-            if cond:
-                next_pc = instr.extra['label']
-        elif m in _JUMP2:
-            checked = self.hw_checked(instr)
-            if checked:
-                confidence = "HIGH CONFIDENCE"
-                note = checked
-            elif m in ("jand", "jnand"):
-                confidence = "BEST-EFFORT"
-                note = f"{m}: this fork's naming (jand: A & B != 0), not measured on this architecture"
-            else:
-                confidence = "BEST-EFFORT"
-                note = f"{m}: b43-asm's definition, not verified against hardware"
-            x, y = self.read(instr.op0) & 0xFFFF, self.read(instr.op1) & 0xFFFF
-            sx = x - 0x10000 if x & 0x8000 else x
-            sy = y - 0x10000 if y & 0x8000 else y
-            d = (x - y) & 0xFFFF
-            sd = d - 0x10000 if d & 0x8000 else d
-            # b43-asm: the "s" comparisons are the signed ones; jdn..jdnz
-            # test the difference without the carry
-            cond = {
-                "je": x == y, "jne": x != y,
-                "jls": sx < sy, "jges": sx >= sy, "jgs": sx > sy, "jles": sx <= sy,
-                "jl": x < y, "jge": x >= y, "jg": x > y, "jle": x <= y,
-                "js": (x & y) == x, "jns": (x & y) != x,
-                "jand": (x & y) != 0, "jnand": (x & y) == 0,
-                "jdn": sd < 0, "jdpz": sd >= 0, "jdp": sd > 0, "jdnz": sd <= 0,
-            }.get(m)
-            if cond:
-                next_pc = instr.extra['label']
-        elif m.startswith("unk_") or m in ("ret", "tkiph", "tkiphs", "tkipl", "tkipls", "tkip?"):
-            confidence = "UNIMPLEMENTED"
-            note = (f"instruction {m} not implemented (not even b43-dasm knows it, for unk_*) "
-                     "-- treated as a NOP, subsequent state is NOT reliable")
-            if self.strict:
-                raise NotImplementedError(f"@{self.pc:04X}: {m} not implemented ({note})")
-            self.unimpl_count += 1
         else:
-            raise NotImplementedError(f"@{self.pc:04X}: unhandled mnemonic: {m}")
+            run = _EXEC.get(m) or (_EXEC_UNIMPL if m.startswith("unk_") or m in _UNIMPL else None)
+            if run is None:
+                raise NotImplementedError(f"@{self.pc:04X}: unhandled mnemonic: {m}")
+            next_pc = run(self, instr)
+            if next_pc is None:
+                next_pc = self.pc + 1
 
         if self.tracing:
+            if confidence is None:
+                confidence, note = self.describe(instr)
             self.trace.append((instr, confidence, note))
 
         self.pc = next_pc
@@ -551,11 +415,60 @@ class PSM:
         else:
             self._steps_since_progress += 1
             if self._steps_since_progress > self.stall_threshold:
+                if confidence is None:
+                    confidence, note = self.describe(instr)
                 raise HardwareWaitLoop(
                     f"no progress past PC={self._high_water:04X} for "
                     f"{self.stall_threshold} steps (last instruction: {m} @ {instr.addr:04X}, "
                     f"{note or 'likely waiting on an unemulated hardware flag'})"
                 )
+
+    def describe(self, instr):
+        """(confidence, note) of an executed instruction."""
+        m = instr.mnem
+        if m in ("rl", "rr"):
+            # BEST-EFFORT: 16-bit rotation (consistent with a 16-bit SHM
+            # word); whether the real width is 16 or 32 bit is unverified.
+            return "BEST-EFFORT", "rotation width (16 vs 32 bit) unverified"
+        if m == "orx":
+            a, b = instr.extra['a'], instr.extra['b']
+            note = self.hw_checked(instr)
+            if note:
+                return "HIGH", note
+            return "BEST-EFFORT", f"orx M={a},S={b}: not checked against hardware in this form"
+        if m == "srx":
+            a, b = instr.extra['a'], instr.extra['b']
+            return "BEST-EFFORT", f"srx M={a},S={b}: shift right over two registers, not checked on hardware"
+        if m in ("jzx", "jnzx"):
+            a, b = instr.extra['a'], instr.extra['b']
+            # jzx/jnzx M,S,SRC,Y,LABEL: per assembler/main.c's emulate_jand_insn()
+            # -- the actual generator of "jand REG,0xMASK,LABEL" once 0xMASK is
+            # too wide for a plain JAND immediate. first_bit/last_bit come from
+            # the contiguous-bitmask scan; M = last_bit-first_bit (width-1),
+            # S = first_bit-1 (0-indexed position). SRC is oper[2] -- whichever
+            # of the original two JAND operands was NOT the immediate mask.
+            # Y (-> op1 here) is always a dummy immediate (em_imm.imm = 0):
+            #     em_ol.oper[3] = &em_op_y;
+            # it is never read or combined with SRC. So this tests (M+1) bits
+            # of op0 ALONE, starting at bit S -- not a 32-bit op0:op1 pair.
+            return "HIGH", f"{m} width={a+1},pos={b}: testing bits [{b+a}:{b}] of op0 alone"
+        if m in ("jext", "jnext"):
+            imm = instr.extra['imm']
+            if (imm & 0x7F) == COND_TRUE:
+                return "HIGH CONFIDENCE", f"{m} 0x{imm:02X}: COND_TRUE, always true"
+            cond_true = self.ext_flags.get(imm & 0x7F, False)
+            return "STUB", f"{m} 0x{imm:02X}: hardware flag not emulated, assuming {cond_true}"
+        if m in _JUMP2:
+            checked = self.hw_checked(instr)
+            if checked:
+                return "HIGH CONFIDENCE", checked
+            if m in ("jand", "jnand"):
+                return "BEST-EFFORT", f"{m}: this fork's naming (jand: A & B != 0), not measured on this architecture"
+            return "BEST-EFFORT", f"{m}: b43-asm's definition, not verified against hardware"
+        if m.startswith("unk_") or m in _UNIMPL:
+            return "UNIMPLEMENTED", (f"instruction {m} not implemented (not even b43-dasm knows it, for unk_*) "
+                                     "-- treated as a NOP, subsequent state is NOT reliable")
+        return "HIGH", ""
 
     def goto(self, pc):
         """Continue at pc, restarting the stall detection from there."""
@@ -576,6 +489,148 @@ class PSM:
             except HaltExecution as e:
                 return f"halt: {e}"
         return "max_steps reached"
+
+
+def _add(psm, i):
+    m = i.mnem
+    # b43-asm: the "c" forms add the carry, the "." forms set it
+    r = (psm.read(i.op0) & 0xFFFF) + (psm.read(i.op1) & 0xFFFF)
+    if m[3:4] == "c":
+        r += psm.carry
+    if m[-1] == ".":
+        psm.carry = int(r > 0xFFFF)
+    psm.write(i.op2, r)
+
+
+def _sub(psm, i):
+    m = i.mnem
+    r = (psm.read(i.op0) & 0xFFFF) - (psm.read(i.op1) & 0xFFFF)
+    if m[3:4] == "c":
+        r -= psm.carry
+    if m[-1] == ".":
+        psm.carry = int(r < 0)
+    psm.write(i.op2, r)
+
+
+def _mul(psm, i):
+    # b43-asm: spr06d = low half of the product, rD = high half
+    r = (psm.read(i.op0) & 0xFFFF) * (psm.read(i.op1) & 0xFFFF)
+    psm.store(('spr', 0x06D), r & 0xFFFF)
+    psm.write(i.op2, r >> 16)
+
+
+def _sra(psm, i):
+    v = psm.read(i.op0) & 0xFFFF
+    sh = psm.read(i.op1) & 0x1F
+    if v & 0x8000:
+        v -= 0x10000
+    psm.write(i.op2, v >> sh)
+
+
+def _rotate(psm, i):
+    v = psm.read(i.op0) & 0xFFFF
+    sh = psm.read(i.op1) & 0xF
+    if i.mnem == "rl":
+        v = ((v << sh) | (v >> (16 - sh))) & 0xFFFF if sh else v
+    else:
+        v = ((v >> sh) | (v << (16 - sh))) & 0xFFFF if sh else v
+    psm.write(i.op2, v)
+
+
+def _orx(psm, i):
+    # orx M,S,A,B: A rotated left by S, M+1 bits of it at S over B
+    a, b = i.extra['a'], i.extra['b']
+    x = psm.read(i.op0) & 0xFFFF
+    rot = ((x << b) | (x >> (16 - b))) & 0xFFFF if b else x
+    mask = (((1 << (a + 1)) - 1) << b) & 0xFFFF
+    psm.write(i.op2, (rot & mask) | (psm.read(i.op1) & ~mask & 0xFFFF))
+
+
+def _srx(psm, i):
+    # srx M,S,A,B: M+1 bits at S of B:A (B the high word)
+    a, b = i.extra['a'], i.extra['b']
+    v = ((psm.read(i.op1) & 0xFFFF) << 16) | (psm.read(i.op0) & 0xFFFF)
+    psm.write(i.op2, (v >> b) & ((1 << (a + 1)) - 1))
+
+
+def _jzx(psm, i):
+    a, b = i.extra['a'], i.extra['b']
+    field = (psm.read(i.op0) >> b) & ((1 << (a + 1)) - 1)
+    if (field == 0) == (i.mnem == "jzx"):
+        return i.extra['label']
+    return None
+
+
+def _jext(psm, i):
+    imm = i.extra['imm']
+    if (imm & 0x7F) == COND_TRUE:
+        cond_true = True
+    else:
+        # bit 7 asks for an EOI of the same signal once it is tested
+        cond_true = psm.ext_flags.get(imm & 0x7F, False)
+        if imm & 0x80 and psm.on_eoi:
+            psm.on_eoi(imm & 0x7F)
+    if cond_true == (i.mnem == "jext"):
+        return i.extra['label']
+    return None
+
+
+def _signed(v):
+    return v - 0x10000 if v & 0x8000 else v
+
+
+# b43-asm: the "s" comparisons are the signed ones; jdn..jdnz test the
+# difference without the carry
+_COMPARE = {
+    "je": lambda x, y: x == y, "jne": lambda x, y: x != y,
+    "jls": lambda x, y: _signed(x) < _signed(y), "jges": lambda x, y: _signed(x) >= _signed(y),
+    "jgs": lambda x, y: _signed(x) > _signed(y), "jles": lambda x, y: _signed(x) <= _signed(y),
+    "jl": lambda x, y: x < y, "jge": lambda x, y: x >= y,
+    "jg": lambda x, y: x > y, "jle": lambda x, y: x <= y,
+    "js": lambda x, y: (x & y) == x, "jns": lambda x, y: (x & y) != x,
+    "jand": lambda x, y: (x & y) != 0, "jnand": lambda x, y: (x & y) == 0,
+    "jdn": lambda x, y: _signed((x - y) & 0xFFFF) < 0,
+    "jdpz": lambda x, y: _signed((x - y) & 0xFFFF) >= 0,
+    "jdp": lambda x, y: _signed((x - y) & 0xFFFF) > 0,
+    "jdnz": lambda x, y: _signed((x - y) & 0xFFFF) <= 0,
+}
+
+
+def _jump2(psm, i):
+    compare = _COMPARE.get(i.mnem)
+    if compare and compare(psm.read(i.op0) & 0xFFFF, psm.read(i.op1) & 0xFFFF):
+        return i.extra['label']
+    return None
+
+
+def _unimpl(psm, i):
+    if psm.strict:
+        _, note = psm.describe(i)
+        raise NotImplementedError(f"@{psm.pc:04X}: {i.mnem} not implemented ({note})")
+    psm.unimpl_count += 1
+
+
+_UNIMPL = frozenset(("ret", "tkiph", "tkiphs", "tkipl", "tkipls", "tkip?"))
+_EXEC_UNIMPL = _unimpl
+_EXEC = {
+    "add": _add, "add.": _add, "addc": _add, "addc.": _add,
+    "sub": _sub, "sub.": _sub, "subc": _sub, "subc.": _sub,
+    "mul": _mul,
+    "and": lambda psm, i: psm.write(i.op2, psm.read(i.op0) & psm.read(i.op1)),
+    "or": lambda psm, i: psm.write(i.op2, psm.read(i.op0) | psm.read(i.op1)),
+    "xor": lambda psm, i: psm.write(i.op2, psm.read(i.op0) ^ psm.read(i.op1)),
+    # b43-asm: clear the bits of B in A
+    "nand": lambda psm, i: psm.write(i.op2, psm.read(i.op0) & ~psm.read(i.op1)),
+    "sr": lambda psm, i: psm.write(i.op2, (psm.read(i.op0) & 0xFFFF) >> (psm.read(i.op1) & 0x1F)),
+    "sl": lambda psm, i: psm.write(i.op2, psm.read(i.op0) << (psm.read(i.op1) & 0x1F)),
+    "sra": _sra,
+    "rl": _rotate, "rr": _rotate,
+    "orx": _orx, "srx": _srx,
+    "nap": lambda psm, i: None,
+    "jzx": _jzx, "jnzx": _jzx,
+    "jext": _jext, "jnext": _jext,
+}
+_EXEC.update((m, _jump2) for m in _JUMP2)
 
 
 def cli(isa, example):
