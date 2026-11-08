@@ -192,6 +192,13 @@ reads and says when an interrupt is pending. The board is given by options
     T <us>                  time passes              -> K <irq>
     Q                       end                      -> K <irq>
 
+`devices.py` models PHY and radio as register files plus behaviours (table
+ports, busy bits, status bits), chosen by PHY type and radio id. `devcheck.py`
+replays the PHY and radio accesses of a capture on them and counts the reads
+they predict right:
+
+    ./devcheck.py cold01-clean.txt --phy-type 0xb --radio-id 0x2069
+
 `lockstep.py` co-simulates a host op stream with the ucode as one machine:
 the PSM starts at PC 0 on PSM_RUN and runs `--cycles` instructions after
 every host operation, over shared memory and an IHR register file the

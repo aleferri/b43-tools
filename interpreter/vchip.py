@@ -47,7 +47,8 @@ other condition is false. The TX engine is a model, not a known semantic.
 
 With mhz F the TSF advances one microsecond every F instructions (a model).
 settle() runs the PSM until idle: back at a (pc, call stack, carry, raised
-conditions) with no net change and no TSF read since. wait() and advance()
+conditions) with no net change and no read since of the TSF or of a device
+waiting on a timer. wait() and advance()
 let time pass, the clock jumping to the next TBTT while the ucode is idle;
 advance() does not run an idle PSM again until the host writes.
 """
@@ -124,6 +125,7 @@ class RegisterFile:
       read(addr) / write(addr, value)   a transaction, from host or ucode
       known(addr)                       whether anyone set the register
       seed(addr, value)                 set it unless someone already did
+      observe(addr, value)              the value a real device returned
       snapshot()                        a comparable copy of the state
 
     A model of a PHY or a radio extends it with what its registers do."""
@@ -143,6 +145,17 @@ class RegisterFile:
 
     def seed(self, addr, value):
         self.regs.setdefault(addr, value & 0xFFFF)
+
+    def observe(self, addr, value):
+        self.regs[addr] = value & 0xFFFF
+
+    def waiting(self):
+        """Whether a read could return something else later with no write."""
+        return False
+
+    def next_change(self):
+        """When, in microseconds, a read could next return something else."""
+        return None
 
     def snapshot(self):
         return dict(self.regs)
@@ -172,12 +185,14 @@ class Recorder:
 
 class Chip:
     def __init__(self, prog, hw, devices=None, inits=None, tx=None, mhz=None,
-                 recorder=None, phy_version=None):
+                 recorder=None, phy_version=None, skip_time_waits=False):
         self.prog = prog
         self.hw = hw
         self.devices = {name: RegisterFile(name) for name in
                         ["phy", "radio"] + [bus.name for bus in hw.buses]}
         self.devices.update(devices or {})
+        for dev in self.devices.values():
+            dev.now = self.us
         self.phy = self.devices["phy"]
         self.radio = self.devices["radio"]
         self.phy_version = phy_version
@@ -195,6 +210,7 @@ class Chip:
         self.clock = 0                  # time, in PSM instructions
         self.tsf_base, self.tsf_clock = 0, 0
         self.tbtt_us, self.next_tbtt = 0, None
+        self.clock_read_at = -1         # step of the last ucode read of something timed
         self.tsf_read_at = -1           # step of the last ucode read of the TSF
         self.inits = inits or []
         self.inits_state = "wait" if self.inits else "none"   # wait, due, done
@@ -210,6 +226,7 @@ class Chip:
         self.mmio = {}                  # registers without a meaning here
         self.unmodelled = {}            # offset -> reads of them
         self.quiet = False              # idle, and no host write since
+        self.skip_time_waits = skip_time_waits
         self.host_regs = {hr.spr: hr for hr in hw.host_regs}
         self.host_spr = set()           # SPRs the host has written
         self.host_epoch = 0             # bumped by host writes made during a run
@@ -449,6 +466,10 @@ class Chip:
         return (self.macctl, self.m.pc, self.host_epoch, list(self.m.shm), dict(self.m.spr),
                 {name: d.snapshot() for name, d in self.devices.items()})
 
+    def us(self):
+        """The chip's time in microseconds."""
+        return self.clock / self.mhz if self.mhz else 0
+
     def tsf(self):
         return self.tsf_base + int((self.clock - self.tsf_clock) / self.mhz)
 
@@ -514,6 +535,7 @@ class Chip:
 
     def observe(self, loc, old, new):
         kind, n = loc
+        final = new
         if self.tx and kind == "spr":
             self.tx_schedule(loc, old, new)
         if self.mhz and kind == "spr" and n in TSF_SPRS:
@@ -522,7 +544,7 @@ class Chip:
                 and self.inits_state == "wait":
             self.inits_state = "due"
         self.recorder.store(loc, old, new)
-        if new != old:
+        if final != old:
             self.changes.append((loc, old))
 
     def step(self):
@@ -542,7 +564,7 @@ class Chip:
             if op is None or op.kind != "spr":
                 continue
             if self.mhz and op.value in TSF_SPRS:
-                self.tsf_read_at = self.steps
+                self.clock_read_at = self.tsf_read_at = self.steps
             elif op.value not in m.spr and op.value not in self.host_spr:
                 self.recorder.unset_spr_read(op.value, pc)
         self.recorder.step(pc, ins, m.ext_flags)
@@ -574,6 +596,8 @@ class Chip:
         addr = cmd & bus.command.addr_mask
         if kind == "read":
             src = "host" if dev.known(addr) else "never set"
+            if dev.waiting():
+                self.clock_read_at = self.steps
             val = dev.read(addr)
             m.store(("spr", bus.data_spr), val)
         else:
@@ -588,24 +612,50 @@ class Chip:
             if not self.step():
                 return
 
-    def settle(self, max_steps):
+    def settle(self, max_steps, until=None):
         """Run until idle; return (steps until the idle cycle began, its pc),
-        the pc being None if max_steps ran out first."""
+        the pc being None if max_steps ran out, or the clock reached until,
+        first. With skip_time_waits, a cycle that changes nothing but reads
+        the TSF or a timed device moves the clock to when such a read could
+        differ instead of running again."""
         m = self.m
         start, self.changes, seen, epoch = self.steps, [], {}, self.host_epoch
-        while self.running and self.steps - start < max_steps:
+        while self.running and self.steps - start < max_steps and \
+                (until is None or self.clock < until):
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
             key = (m.pc, tuple(m.call_stack), m.carry,
                    tuple(sorted(self.events)))
             prev = seen.get(key)
-            if prev is not None and not self.pending and \
-                    self.tsf_read_at < prev[0] and self.unchanged_since(prev[1]):
-                return prev[0] - start, m.pc
+            if prev is not None and not self.pending and self.unchanged_since(prev[1]):
+                if self.clock_read_at < prev[0]:
+                    return prev[0] - start, m.pc
+                if self.skip_time_waits:
+                    wake = self.next_wake(tsf=self.tsf_read_at >= prev[0])
+                    if until is not None:
+                        wake = min(wake, until)
+                    if wake > self.clock:
+                        self.clock = wake
+                        seen = {}
+                        continue
             seen[key] = (self.steps, len(self.changes))
             if not self.step():
                 break
         return self.steps - start, None
+
+    def next_wake(self, tsf):
+        """The clock at which a read of a timed device, of the TBTT condition
+        or, if tsf, of the TSF could next give something else."""
+        wakes = [self.tsf_clock + (self.tsf() + 1 - self.tsf_base) * self.mhz] if tsf else []
+        due = self.tbtt_due_clock()
+        if due is not None:
+            wakes.append(due)
+        for dev in self.devices.values():
+            t = dev.next_change()
+            if t is not None:
+                wakes.append(t * self.mhz)
+        later = [w for w in wakes if w > self.clock]
+        return int(min(later) + 0.999999) if later else self.clock
 
     def unchanged_since(self, i):
         first_old = {}
@@ -623,7 +673,7 @@ class Chip:
             if not self.running:
                 break
             if not self.quiet:
-                steps, pc = self.settle(end - self.clock)
+                steps, pc = self.settle(end - self.clock, until=end)
                 if pc is None:
                     continue
                 self.quiet = True
