@@ -32,8 +32,8 @@ registers as the chip starts with them (--phy 0xb=0x2bdb for a 3-core AC-PHY,
 --radio 0=0x4 --radio 1=0x2069 for a radio 2069 rev 4 as b43 reads it on
 corerev 40/42).
 
-    vchipd.py --corerev N --phy-ver V [--phy REG=VAL ...] [--radio REG=VAL ...]
-              [--psm-mhz F]
+    vchipd.py --corerev N --phy-ver V [--phy REG=VAL ...] [--radio-id I]
+              [--radio REG=VAL ...] [--psm-mhz F]
               [--access-us U] [--tx-engine IFS,START,DONE] [--report FILE]
 """
 
@@ -41,6 +41,7 @@ import argparse
 import sys
 
 import core
+import devices
 import vchip
 
 
@@ -103,6 +104,8 @@ def main():
                     help="MMIO PHY_VER: analog << 12 | type << 8 | revision")
     ap.add_argument("--phy", action="append", default=[], metavar="REG=VAL",
                     help="a PHY register as the chip starts with it")
+    ap.add_argument("--radio-id", type=lambda x: int(x, 0),
+                    help="radio id, for the radio model (e.g. 0x2069)")
     ap.add_argument("--radio", action="append", default=[], metavar="REG=VAL",
                     help="a radio register as the chip starts with it")
     ap.add_argument("--psm-mhz", type=float, default=80.0,
@@ -115,9 +118,10 @@ def main():
 
     hw = core.for_corerev(args.corerev)
     tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
-    devices = {"phy": vchip.RegisterFile("phy", board_regs(args.phy)),
-               "radio": vchip.RegisterFile("radio", board_regs(args.radio))}
-    chip = vchip.Chip([], hw, devices, tx=tx, mhz=args.psm_mhz, phy_version=args.phy_ver)
+    devs = {"phy": devices.phy_device(args.phy_ver >> 8 & 0xF, board_regs(args.phy)),
+            "radio": devices.radio_device(args.radio_id, board_regs(args.radio))}
+    chip = vchip.Chip([], hw, devs, tx=tx, mhz=args.psm_mhz, phy_version=args.phy_ver,
+                      skip_time_waits=True)
     serve(chip, args.access_us, sys.stdin, sys.stdout)
     if args.report:
         with open(args.report, "w") as out:
