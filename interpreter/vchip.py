@@ -29,7 +29,8 @@ Host MMIO, as b43 uses it:
   0x120              MACCONTROL: PSM_RUN runs the PSM, PSM_JMP_0 restarts it
                      at 0; its high half is SPR 0x041.
   0x124/0x128/0x12C  MACCMD, GEN_IRQ_REASON (write 1 to clear), IRQ mask:
-                     SPR 0x047, 0x042/0x043, 0x044/0x045.
+                     SPR 0x047, 0x042/0x043, 0x044/0x045. The ucode clears
+                     MACCMD bits and raises IRQ bits by writing them.
   0x180/0x184        TSF; 0x188/0x18C beacon interval (us << 6) and first TBTT.
   0x400 + 2n         SPR n; the profile's host_regs act on host accesses.
 Any other register reads back what was written; reads of it are counted.
@@ -536,6 +537,12 @@ class Chip:
     def observe(self, loc, old, new):
         kind, n = loc
         final = new
+        if kind == "spr" and n == SPR_MAC_CMD:
+            final = old & ~new
+        elif kind == "spr" and n in (SPR_IRQ_LO, SPR_IRQ_HI):
+            final = old | new
+        if final != new:
+            self.m.spr[n] = final
         if self.tx and kind == "spr":
             self.tx_schedule(loc, old, new)
         if self.mhz and kind == "spr" and n in TSF_SPRS:
