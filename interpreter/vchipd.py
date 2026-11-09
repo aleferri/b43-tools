@@ -34,7 +34,7 @@ corerev 40/42).
 
     vchipd.py --corerev N --phy-ver V [--phy REG=VAL ...] [--radio-id I]
               [--radio REG=VAL ...] [--psm-mhz F]
-              [--access-us U] [--tx-engine IFS,START,DONE] [--report FILE]
+              [--access-us U] [--tx-engine IFS,START,DONE] [--nap-us U] [--report FILE]
 """
 
 import argparse
@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--access-us", type=float, default=0.1,
                     help="time a bus access takes, in microseconds (default 0.1)")
     ap.add_argument("--tx-engine", metavar="IFS,START,DONE")
+    ap.add_argument("--nap-us", type=float, default=100.0,
+                    help="longest nap, for wake-ups the chip does not model (default 100)")
     ap.add_argument("--report")
     args = ap.parse_args()
 
@@ -121,7 +123,7 @@ def main():
     devs = {"phy": devices.phy_device(args.phy_ver >> 8 & 0xF, board_regs(args.phy)),
             "radio": devices.radio_device(args.radio_id, board_regs(args.radio))}
     chip = vchip.Chip([], hw, devs, tx=tx, mhz=args.psm_mhz, phy_version=args.phy_ver,
-                      skip_time_waits=True)
+                      skip_time_waits=True, nap_us=args.nap_us)
     serve(chip, args.access_us, sys.stdin, sys.stdout)
     if args.report:
         with open(args.report, "w") as out:

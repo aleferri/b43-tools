@@ -46,6 +46,14 @@ COND_TX_DONE after the profile's tx_go; with the TSF running
 COND_TX_TBTTEXPIRE at each TBTT. Each is held until the ucode's EOI; every
 other condition is false. The TX engine is a model, not a known semantic.
 
+nap stops the PSM until a condition not raised when it stopped, a host write,
+a TX engine condition on its way, the expiry of a TSF general-purpose timer
+(GPT0..2: STAT bit 15 arms it for CNT ticks, or VAL if CNT is zero, at 8 MHz
+with bit 14 else 88 MHz; CNT reads as the ticks left), or SPR_MAC_MAX_NAP
+read in microseconds. Other wake-ups of the hardware are not known; nap_us
+caps the nap in their place (vchipd: 100 us; the stock driver sees
+MAC_SUSPENDED within about 20 us of a MAC disable on vd625).
+
 With mhz F the TSF advances one microsecond every F instructions (a model).
 settle() runs the PSM until idle: back at a (pc, call stack, carry, raised
 conditions) with no net change and no read since of the TSF or of a device
@@ -61,7 +69,7 @@ import psmlib
 MACCTL, MACCMD, IRQ_REASON, IRQ_MASK = 0x120, 0x124, 0x128, 0x12C
 MACCTL_ENABLED, MACCTL_PSM_RUN, MACCTL_PSM_JMP0 = 0x1, 0x2, 0x4
 IHR_BASE = 0x400
-SPR_MAC_CTLHI, SPR_IRQ_LO, SPR_IRQ_HI = 0x041, 0x042, 0x043
+SPR_MAX_NAP, SPR_MAC_CTLHI, SPR_IRQ_LO, SPR_IRQ_HI = 0x040, 0x041, 0x042, 0x043
 SPR_IRQMASK_LO, SPR_IRQMASK_HI, SPR_MAC_CMD = 0x044, 0x045, 0x047
 MMIO_PHY_VER = 0x3E0
 COND_MACEN = 0x24
@@ -73,6 +81,14 @@ TSF_SPRS = range(SPR_TSF_WORD0, SPR_TSF_WORD0 + 4)
 TSF_TIMERLOW, TSF_TIMERHIGH = 0x180, 0x184
 TSF_CFPREP, TSF_CFPSTART, CFPREP_CBI_SHIFT = 0x188, 0x18C, 6
 COND_TBTT = 0x2C                # OpenFWWF's COND_TX_TBTTEXPIRE
+# TSF general-purpose timers: STAT, CNT lo/hi, VAL lo/hi (spr.inc's
+# SPR_TSF_GPTn_*). STAT bit 15 enables, bit 14 picks an 8 MHz base over 88 MHz.
+GPTS = ((0x123, 0x125, 0x127, 0x129, 0x12B),
+        (0x124, 0x126, 0x128, 0x12A, 0x12C),
+        (0x133, 0x134, 0x135, 0x136, 0x137))
+GPT_STAT = {g[0]: i for i, g in enumerate(GPTS)}
+GPT_CNT = {s: i for i, g in enumerate(GPTS) for s in g[1:3]}
+GPT_EN, GPT_8MHZ = 0x8000, 0x4000
 IRQ_MAC_SUSPENDED = 0x0001
 HOSTF_WORDS = (0x05E >> 1, 0x060 >> 1, 0x062 >> 1, 0x078 >> 1, 0x0D4 >> 1)
 OBJADDR, OBJDATA, OBJDATA_HI = 0x160, 0x164, 0x166
@@ -186,7 +202,7 @@ class Recorder:
 
 class Chip:
     def __init__(self, prog, hw, devices=None, inits=None, tx=None, mhz=None,
-                 recorder=None, phy_version=None, skip_time_waits=False):
+                 recorder=None, phy_version=None, skip_time_waits=False, nap_us=None):
         self.prog = prog
         self.hw = hw
         self.devices = {name: RegisterFile(name) for name in
@@ -228,6 +244,12 @@ class Chip:
         self.mmio = {}                  # registers without a meaning here
         self.unmodelled = {}            # offset -> reads of them
         self.quiet = False              # idle, and no host write since
+        self.napping = False            # stopped on nap
+        self.nap_events = frozenset()   # conditions raised when it stopped
+        self.nap_until = None           # clock at which SPR_MAC_MAX_NAP runs out
+        self.nap_us = nap_us            # longest nap, standing in for unknown wake-ups
+        self.gpt_due = [None] * len(GPTS)   # clock at which each armed timer expires
+        self.gpt_rate = [8] * len(GPTS)     # its ticks per microsecond
         self.skip_time_waits = skip_time_waits
         self.watched = {bus.addr_spr for bus in hw.buses} | {hs.spr for hs in hw.handshakes}
         self.hw_dirty = False           # a watched SPR was written
@@ -250,6 +272,7 @@ class Chip:
     def host_reg_write(self, off, val, bits):
         """The effect of a host MMIO write on the MAC registers, the TSF and
         the IHR; bits is 16 or 32."""
+        self.poke()
         if self.mhz and off == TSF_CFPREP:
             self.tbtt_us = (val & 0xFFFFFFFF) >> CFPREP_CBI_SHIFT
             self.tbtt_align()
@@ -286,6 +309,7 @@ class Chip:
             self.phy.seed(0, val)
 
     def host_macctl_write(self, val, mask=None):
+        self.poke()
         if mask is not None:
             val = (self.macctl & ~mask) | val
         self.macctl = val
@@ -298,9 +322,11 @@ class Chip:
         self.running = bool(val & MACCTL_PSM_RUN) and self.stopped is None
 
     def host_maccmd_write(self, val):
+        self.poke()
         self.spr_write(SPR_MAC_CMD, val)
 
     def host_shm_write(self, word, val, words=1):
+        self.poke()
         shm = self.m.shm
         shm[word & (len(shm) - 1)] = val & 0xFFFF
         if words == 2:
@@ -310,10 +336,12 @@ class Chip:
         return self.m.shm[word & (len(self.m.shm) - 1)]
 
     def host_hostflags(self, index, val, mask):
+        self.poke()
         w = HOSTF_WORDS[index]
         self.m.shm[w] = (self.m.shm[w] & ~mask) | (val & mask)
 
     def host_phy_write(self, addr, val):
+        self.poke()
         self.phy.write(addr, val)
 
     def write_inits(self):
@@ -322,9 +350,14 @@ class Chip:
         self.inits_state = "done"
         self.host_epoch += 1
 
+    def poke(self):
+        """A host write: the PSM may have something new to look at."""
+        self.quiet = False
+        self.napping = False
+
     def mmio_write(self, off, val, bits):
         """A host write to the D11 core's registers."""
-        self.quiet = False
+        self.poke()
         if off == OBJADDR:
             self.objaddr = val & 0xFFFFFFFF
         elif off in (OBJDATA, OBJDATA_HI):
@@ -499,6 +532,12 @@ class Chip:
             return None
         return self.tsf_clock + (self.next_tbtt - self.tsf_base) * self.mhz
 
+    def next_event_clock(self):
+        """The clock of the next TBTT or nap timeout, or None."""
+        due = [c for c in (self.tbtt_due_clock(), self.nap_until if self.napping else None,
+                           *self.gpt_due) if c is not None]
+        return min(due) if due else None
+
     def tsf_set_word(self, i, val):
         shift = 16 * i
         self.tsf_set(self.tsf() & ~(0xFFFF << shift) | (val & 0xFFFF) << shift)
@@ -535,7 +574,11 @@ class Chip:
         self.m.ext_flags = flags
 
     def raise_events(self):
-        """The TBTT and TX engine conditions that came due."""
+        """The TBTT and TX engine conditions that came due, and the timers
+        that expired."""
+        for i, due in enumerate(self.gpt_due):
+            if due is not None and self.clock >= due:
+                self.gpt_expire(i)
         if self.next_tbtt is not None and self.mhz and \
                 self.tsf_base + int((self.clock - self.tsf_clock) / self.mhz) >= self.next_tbtt:
             self.events.add(COND_TBTT)
@@ -567,6 +610,8 @@ class Chip:
         if kind == "spr" and n == SPR_IRQ_LO and new & IRQ_MAC_SUSPENDED \
                 and self.inits_state == "wait":
             self.inits_state = "due"
+        if kind == "spr" and n in GPT_STAT:
+            self.gpt_write(GPT_STAT[n], final)
         if kind == "spr" and n in self.watched:
             self.hw_dirty = True
         if self.recording:
@@ -579,6 +624,9 @@ class Chip:
         """One ucode instruction plus the hardware the model answers for it.
         False once the PSM has stopped."""
         m, prog = self.m, self.prog
+        if self.asleep():
+            self.clock += 1
+            return True
         pc = m.pc
         if pc >= len(prog):
             self.stopped = f"PC {pc:#x} out of the program"
@@ -587,11 +635,14 @@ class Chip:
         ins = prog[pc]
         if self.prog_info is None:
             self.prog_info = [self.instruction_info(i) for i in prog]
-        reads_tsf, sprs, is_ext = self.prog_info[pc]
+        reads_tsf, sprs, is_ext, is_nap, reads_gpt = self.prog_info[pc]
         self.raise_events()
         if reads_tsf and self.mhz:
             self.tsf_publish()
             self.clock_read_at = self.tsf_read_at = self.steps
+        if reads_gpt and any(d is not None for d in self.gpt_due):
+            self.gpt_publish()
+            self.clock_read_at = self.steps
         if is_ext:
             self.conditions()
         if self.recording:
@@ -607,6 +658,8 @@ class Chip:
             return False
         self.steps += 1
         self.clock += 1
+        if is_nap:
+            self.nap()
         if self.hw_dirty:
             self.hw_dirty = False
             for bus in self.hw.buses:
@@ -623,12 +676,67 @@ class Chip:
             self.write_inits()
         return True
 
+    def gpt_write(self, i, stat):
+        """A ucode write to a timer's STAT: bit 15 arms it for CNT ticks, or
+        VAL if CNT is zero; clear, it stops. A model: the counting and the
+        choice between CNT and VAL are read from how the ucode uses them."""
+        if not stat & GPT_EN or not self.mhz:
+            self.gpt_due[i] = None
+            return
+        _, cntlo, cnthi, vallo, valhi = GPTS[i]
+        spr = self.m.spr
+        ticks = spr.get(cnthi, 0) << 16 | spr.get(cntlo, 0)
+        if not ticks:
+            ticks = spr.get(valhi, 0) << 16 | spr.get(vallo, 0)
+        self.gpt_rate[i] = 8 if stat & GPT_8MHZ else 88
+        self.gpt_due[i] = self.clock + ticks / self.gpt_rate[i] * self.mhz
+
+    def gpt_expire(self, i):
+        stat, cntlo, cnthi = GPTS[i][:3]
+        spr = self.m.spr
+        spr[stat] = spr.get(stat, 0) & ~GPT_EN
+        spr[cntlo] = spr[cnthi] = 0
+        self.gpt_due[i] = None
+        self.napping = False
+
+    def gpt_publish(self):
+        """CNT as the ticks left of each armed timer."""
+        spr = self.m.spr
+        for i, due in enumerate(self.gpt_due):
+            if due is not None:
+                left = max(0, int((due - self.clock) / self.mhz * self.gpt_rate[i]))
+                spr[GPTS[i][1]], spr[GPTS[i][2]] = left & 0xFFFF, left >> 16 & 0xFFFF
+
+    def nap(self):
+        self.napping = True
+        self.nap_events = frozenset(self.events)
+        max_nap = self.m.spr.get(SPR_MAX_NAP, 0)
+        if self.nap_us is not None:
+            max_nap = min(max_nap, self.nap_us) if max_nap else self.nap_us
+        self.nap_until = self.clock + max_nap * self.mhz if self.mhz and max_nap else None
+
+    def asleep(self):
+        """Whether the PSM is still stopped on nap: a new condition, a TX
+        condition on its way, or SPR_MAC_MAX_NAP running out wakes it."""
+        if not self.napping:
+            return False
+        self.raise_events()
+        if not self.napping:
+            return False
+        if self.pending or not self.events <= self.nap_events or \
+                (self.nap_until is not None and self.clock >= self.nap_until):
+            self.napping = False
+            return False
+        return True
+
     def instruction_info(self, ins):
-        """(reads the TSF, other SPRs it reads, is a jext/jnext)."""
+        """(reads the TSF, other SPRs it reads, is a jext/jnext, is a nap,
+        reads a timer)."""
         sprs = [op.value for op in (ins.op0, ins.op1) if op is not None and op.kind == "spr"]
         tsf = self.mhz and any(s in TSF_SPRS for s in sprs)
         others = tuple(s for s in sprs if not (self.mhz and s in TSF_SPRS))
-        return tsf, others, ins.mnem in ("jext", "jnext")
+        gpt = any(s in GPT_STAT or s in GPT_CNT for s in sprs)
+        return tsf, others, ins.mnem in ("jext", "jnext"), ins.mnem == "nap", gpt
 
     def transfer(self, bus, cmd, kind):
         m = self.m
@@ -663,6 +771,8 @@ class Chip:
         start, self.changes, seen, epoch = self.steps, [], {}, self.host_epoch
         while self.running and self.steps - start < max_steps and \
                 (until is None or self.clock < until):
+            if self.asleep():
+                return self.steps - start, m.pc
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
             key = (m.pc, tuple(m.call_stack), m.carry,
@@ -690,9 +800,7 @@ class Chip:
         """The clock at which a read of a timed device, of the TBTT condition
         or, if tsf, of the TSF could next give something else."""
         wakes = [self.tsf_clock + (self.tsf() + 1 - self.tsf_base) * self.mhz] if tsf else []
-        due = self.tbtt_due_clock()
-        if due is not None:
-            wakes.append(due)
+        wakes += [c for c in (self.tbtt_due_clock(), *self.gpt_due) if c is not None]
         for dev in self.devices.values():
             t = dev.next_change()
             if t is not None:
@@ -720,7 +828,7 @@ class Chip:
                 if pc is None:
                     continue
                 self.quiet = True
-            due = self.tbtt_due_clock()
+            due = self.next_event_clock()
             if due is None or due >= end:
                 break
             self.clock = max(self.clock, int(due) + 1)
@@ -743,7 +851,7 @@ class Chip:
                 worked.append((self.tsf(), steps, pc))
             if pc is None:
                 continue
-            due = self.tbtt_due_clock()
+            due = self.next_event_clock()
             if due is None or due >= end:
                 self.clock = end
                 break
