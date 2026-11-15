@@ -40,11 +40,12 @@ PSM_RUN, as brcms_b_coreinit writes them.
 
 The ucode reaches the profile's buses, a transaction completing at once.
 Conditions: COND_TRUE, COND_MACEN from MACCONTROL.ENABLED, condition register
-4 (0x40..0x4F) from SPR_BRC; with a TX engine (IFS, START, DONE in
-instructions) COND_TX_NOW after bit 0 of SPR_TXE0_CTL, COND_TX_POWER and
-COND_TX_DONE after the profile's tx_go; with the TSF running
-COND_TX_TBTTEXPIRE at each TBTT. Each is held until the ucode's EOI; every
-other condition is false. The TX engine is a model, not a known semantic.
+4 (0x40..0x4F) from SPR_BRC, 5 (0x50..0x5F) from SPR_PSM_COND; with a TX
+engine (IFS, START, DONE in instructions) COND_TX_NOW after bit 0 of
+SPR_TXE0_CTL, COND_TX_POWER and COND_TX_DONE after the profile's tx_go; with
+the TSF running COND_TX_TBTTEXPIRE at each TBTT. Each is held until the
+ucode's EOI; every other condition is false. The TX engine is a model, not a
+known semantic.
 
 nap stops the PSM until a condition not raised when it stopped, a host write,
 a TX engine condition on its way, the expiry of a TSF general-purpose timer
@@ -75,7 +76,9 @@ MMIO_PHY_VER = 0x3E0
 COND_MACEN = 0x24
 COND_TX_NOW, COND_TX_POWER, COND_TX_DONE = 0x20, 0x21, 0x22
 CONDREG_BRC = 0x40              # condition register 4 mirrors SPR_BRC
+CONDREG_PSM = 0x50              # condition register 5 mirrors SPR_PSM_COND
 SPR_BRC, SPR_TXE0_CTL = 0x048, 0x080
+SPR_PSM_COND = 0x06C            # spr.inc: "PSM external condition bits"
 SPR_TSF_WORD0 = 0x119           # SPR_TSF_WORD0..3, MMIO 0x632..0x638
 TSF_SPRS = range(SPR_TSF_WORD0, SPR_TSF_WORD0 + 4)
 TSF_TIMERLOW, TSF_TIMERHIGH = 0x180, 0x184
@@ -562,13 +565,15 @@ class Chip:
     def conditions(self):
         """The external conditions, for a jext/jnext."""
         brc = self.m.spr.get(SPR_BRC, 0)
-        key = (self.macctl & MACCTL_ENABLED, brc, tuple(sorted(self.events)) if self.events else ())
+        psm = self.m.spr.get(SPR_PSM_COND, 0)
+        key = (self.macctl & MACCTL_ENABLED, brc, psm, tuple(sorted(self.events)) if self.events else ())
         if key == self.flags_key:
             return
         self.flags_key = key
         flags = {COND_MACEN: bool(self.macctl & MACCTL_ENABLED)}
         for bit in range(16):
             flags[CONDREG_BRC | bit] = bool(brc >> bit & 1)
+            flags[CONDREG_PSM | bit] = bool(psm >> bit & 1)
         for sel in self.events:
             flags[sel] = True
         self.m.ext_flags = flags
