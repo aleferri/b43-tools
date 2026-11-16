@@ -46,6 +46,13 @@ MACSTAT = ("txallfrm txrtsfrm txctsfrm txackfrm txdnlfrm txbcnfrm " + "txfunfl "
            "rxmfrmocast rxcfrmocast rxrtsocast rxctsocast rxdfrmmcast rxmfrmmcast "
            "rxcfrmmcast rxbeaconmbss rxdfrmucastobss rxbeaconobss rxrsptmout").split()
 
+# mac80211's default EDCA parameters (aifs, cw_min, cw_max, txop in 32 us),
+# as b43-next uploads them per queue (b43_qos_params_upload()): BK, BE, VI, VO.
+EDCA = ((7, 15, 1023, 0), (3, 15, 1023, 0), (2, 7, 15, 94), (2, 3, 7, 47))
+SHM_EDCFQ, QOSPARAMS = 0x240 >> 1, 16
+HOSTF1, HF_EDCF = 0x05E >> 1, 0x0100
+SPR_IFS_CTL, IFSCTL_USE_EDCF = 0x144, 0x0004
+
 ME = bytes.fromhex("020000000001")
 PEER = bytes.fromhex("020000000002")
 
@@ -61,6 +68,63 @@ def frame(fc, length, ra, fcs_ok):
     mpdu += struct.pack("<I", fcs)
     plcp = struct.pack("<I", 0xB | len(mpdu) << 5) + b"\0\0"
     return plcp + mpdu
+
+
+def setup(fwdir, ucode, initvals=(), phy_type=0x2):
+    """The chip in its idle AP loop with the host side set up; and its
+    corerev."""
+    name = ucode + ".fw"
+    found = [u for u in fwmatrix.ucodes(fwdir) if u[0] == name]
+    if not found:
+        raise SystemExit(f"{name}: not in {fwdir}")
+    _, corerev, phy = found[0]
+    hw = core.for_corerev(corerev)
+    sets = list(fwmatrix.initvals(fwdir, corerev, phy))
+    if initvals:
+        sets = [(os.path.basename(initvals[0])[:-3], phy_type, list(initvals))]
+    if not sets:
+        raise SystemExit(f"no initvals for {name}: give --initvals and --phy-type")
+    _iv, phy_type, files = sets[0]
+    ls = fwmatrix.run(hw.isa.load_program(os.path.join(fwdir, name)), hw, files,
+                      phy_type, fwmatrix.BEACON, tx=(20, 10, 30), mhz=80)
+    chip = ls.chip
+    chip.m.shm[0x10] = 2352
+    # B43_SHM_SH_CHAN as b43-next writes it: the chanspec on the AC-PHY
+    # (channel 36, 80 MHz: 0xE02A), the channel number before it (1)
+    chip.m.shm[0x50] = 0xE02A if corerev >= 40 else 1
+    # The copy length (SPR_RXE_COPY_LEN) the later cores' initvals give
+    # (0xB4) and corerev 11's do not; ucode11 also reloads it from SHM word
+    # 0x0A on a wake-up (0x0C1F), a word no driver source names. Without it
+    # nothing is copied and ucode11 reads an all-zero header.
+    if not chip.m.spr.get(rxe.SPR_RXE_COPY_LEN):
+        chip.m.spr[rxe.SPR_RXE_COPY_LEN] = chip.m.shm[0x0A] = 0xB4
+    # QoS as b43-next's b43_qos_init() leaves it: the EDCA parameters of each
+    # queue (backoff slots 0 where b43 takes them from the RNG), HF_EDCF and
+    # IFSCTL's USE_EDCF. Without HF_EDCF the ucode sends from FIFO 3 alone.
+    shm = chip.m.shm
+    for q, (aifs, cwmin, cwmax, txop) in enumerate(EDCA):
+        base = SHM_EDCFQ + q * QOSPARAMS
+        for i, v in enumerate((txop * 32, cwmin, cwmax, cwmin, aifs, 0, aifs)):
+            shm[base + i] = v
+        shm[base + 7] |= 0x100          # B43_QOSPARAM_STATUS: updated
+    shm[HOSTF1] |= HF_EDCF
+    chip.spr_write(SPR_IFS_CTL, chip.m.spr.get(SPR_IFS_CTL, 0) | IFSCTL_USE_EDCF)
+    # MACCMD's DFQ_VALID, which the initvals set (and b43-next on the AC);
+    # fwmatrix's op stream writes MACCMD whole. The ucode
+    # sends from its FIFOs only with it set (OpenFWWF's ready_for_header_copy).
+    chip.spr_write(vchip.SPR_MAC_CMD, chip.m.spr.get(vchip.SPR_MAC_CMD, 0) | 0x4)
+    if corerev >= 40:
+        amt_row(chip, 0x3F, ME, 0x8008)
+        amt_row(chip, 0x3E, ME, 0x8002)
+    return chip, corerev
+
+
+def moved(chip, counters):
+    """The SHM counters that moved since `counters`, named."""
+    return " ".join(
+        f"{0x70 + i:#05x}{'(' + MACSTAT[i] + ')' if i < len(MACSTAT) else ''}"
+        f"+{(chip.m.shm[0x70 + i] - v) & 0xFFFF}"
+        for i, v in enumerate(counters) if chip.m.shm[0x70 + i] != v)
 
 
 def main():
@@ -85,33 +149,7 @@ def main():
     args = ap.parse_args()
 
     name = args.ucode + ".fw"
-    found = [u for u in fwmatrix.ucodes(args.fwdir) if u[0] == name]
-    if not found:
-        raise SystemExit(f"{name}: not in {args.fwdir}")
-    _, corerev, phy = found[0]
-    hw = core.for_corerev(corerev)
-    sets = list(fwmatrix.initvals(args.fwdir, corerev, phy))
-    if args.initvals:
-        sets = [(os.path.basename(args.initvals[0])[:-3], args.phy_type, args.initvals)]
-    if not sets:
-        raise SystemExit(f"no initvals for {name}: give --initvals and --phy-type")
-    iv, phy_type, files = sets[0]
-    ls = fwmatrix.run(hw.isa.load_program(os.path.join(args.fwdir, name)), hw, files,
-                      phy_type, fwmatrix.BEACON, tx=(20, 10, 30), mhz=80)
-    chip = ls.chip
-    chip.m.shm[0x10] = 2352
-    # B43_SHM_SH_CHAN as b43-next writes it: the chanspec on the AC-PHY
-    # (channel 36, 80 MHz: 0xE02A), the channel number before it (1)
-    chip.m.shm[0x50] = 0xE02A if corerev >= 40 else 1
-    # The copy length (SPR_RXE_COPY_LEN) the later cores' initvals give
-    # (0xB4) and corerev 11's do not; ucode11 also reloads it from SHM word
-    # 0x0A on a wake-up (0x0C1F), a word no driver source names. Without it
-    # nothing is copied and ucode11 reads an all-zero header.
-    if not chip.m.spr.get(rxe.SPR_RXE_COPY_LEN):
-        chip.m.spr[rxe.SPR_RXE_COPY_LEN] = chip.m.shm[0x0A] = 0xB4
-    if corerev >= 40:
-        amt_row(chip, 0x3F, ME, 0x8008)
-        amt_row(chip, 0x3E, ME, 0x8002)
+    chip, corerev = setup(args.fwdir, args.ucode, args.initvals, args.phy_type)
 
     pcs, tx = set(), []
 
@@ -137,16 +175,14 @@ def main():
                                       ra_match=old and ra == ME, bss_match=old))
         chip.wait(args.us, 300000)
     us = lambda clock: (clock - t0) / chip.mhz
-    print(f"{name} ({iv}): frame of {len(f.data)} bytes, fc {args.fc:#06x}")
+    print(f"{name}: frame of {len(f.data)} bytes, fc {args.fc:#06x}")
     for clock, event in chip.rxe.log:
         print(f"  {us(clock):8.2f} us  {event}")
     for clock, sel in tx:
         print(f"  {us(clock):8.2f} us  TX condition {sel:#04x}")
     for p in chip.rxe.fifo:
         print(f"  FIFO: RX header {p.rxhdr.hex() or '-'}, pad {p.pad}, {len(p.data)} bytes")
-    moved = [f"{0x70 + i:#05x}{'(' + MACSTAT[i] + ')' if i < len(MACSTAT) else ''}+{(chip.m.shm[0x70 + i] - v) & 0xFFFF}"
-             for i, v in enumerate(counters) if chip.m.shm[0x70 + i] != v]
-    print(f"  SHM counters: {' '.join(moved) or '-'}")
+    print(f"  SHM counters: {moved(chip, counters) or '-'}")
     print(f"  {len(pcs)} PCs executed, PSM "
           f"{'stopped: ' + chip.stopped if chip.stopped else f'at {chip.m.pc:#06x}'}")
 

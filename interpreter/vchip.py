@@ -71,6 +71,7 @@ import struct
 
 import psmlib
 import rxe
+import txe
 
 MACCTL, MACCMD, IRQ_REASON, IRQ_MASK = 0x120, 0x124, 0x128, 0x12C
 MACCTL_ENABLED, MACCTL_PSM_RUN, MACCTL_PSM_JMP0 = 0x1, 0x2, 0x4
@@ -273,6 +274,9 @@ class Chip:
         self.raised_at = {}             # event -> step it was first seen raised
         self.tested_at = {}             # selector -> step of its last jext/jnext
         self.rxe = rxe.RxEngine(self)
+        self.txe = txe.TxEngine(self) if hw.corerev < 40 else None
+        if self.txe is not None:
+            self.watched |= set(txe.WATCHED)
         self.watched |= {rxe.SPR_RXE_FIFOCTL1, rxe.SPR_RXE_LOOKUP40}
 
     def spr_write(self, n, val):
@@ -547,7 +551,8 @@ class Chip:
     def next_event_clock(self):
         """The clock of the next TBTT or nap timeout, or None."""
         due = [c for c in (self.tbtt_due_clock(), self.nap_until if self.napping else None,
-                           *self.gpt_due, self.rxe.next_clock()) if c is not None]
+                           *self.gpt_due, self.rxe.next_clock(),
+                           self.txe.next_clock() if self.txe else None) if c is not None]
         return min(due) if due else None
 
     def tsf_set_word(self, i, val):
@@ -575,7 +580,7 @@ class Chip:
         """The external conditions, for a jext/jnext."""
         brc = self.m.spr.get(SPR_BRC, 0)
         psm = self.m.spr.get(SPR_PSM_COND, 0)
-        held = self.events | self.rxe.levels if self.rxe.levels else self.events
+        held = self.held()
         key = (self.macctl & MACCTL_ENABLED, brc, psm, tuple(sorted(held)) if held else ())
         if key == self.flags_key:
             return
@@ -587,6 +592,13 @@ class Chip:
         for sel in held:
             flags[sel] = True
         self.m.ext_flags = flags
+
+    def held(self):
+        """The raised conditions: events and the engines' levels."""
+        held = self.events | self.rxe.levels if self.rxe.levels else self.events
+        if self.txe is not None:
+            held = held | self.txe.held()
+        return held
 
     def raise_events(self):
         """The TBTT and TX engine conditions that came due, and the timers
@@ -603,6 +615,8 @@ class Chip:
             else:
                 self.next_tbtt = None
         self.rxe.tick()
+        if self.txe is not None:
+            self.txe.tick()
         if self.pending:
             due = [p for p in self.pending if p[0] <= self.steps]
             for p in due:
@@ -632,6 +646,8 @@ class Chip:
             self.hw_dirty = True
             if n == rxe.SPR_RXE_LOOKUP40 and new & 1:
                 self.rxe.lookup_due = True
+            elif self.txe is not None and n in txe.WATCHED:
+                self.txe.writes.append((n, new))
         if self.recording:
             self.recorder.store(loc, old, new)
         if final != old:
@@ -693,6 +709,8 @@ class Chip:
                 if answer != value:
                     m.store(("spr", hs.spr), answer)
             self.rxe.service()
+            if self.txe is not None:
+                self.txe.service_all()
         if self.inits_state == "due":
             self.write_inits()
         return True
@@ -808,7 +826,7 @@ class Chip:
                 return self.steps - start, m.pc
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
-            held = self.events | self.rxe.levels if self.rxe.levels else self.events
+            held = self.held()
             key = (m.pc, tuple(m.call_stack), m.carry,
                    tuple(sorted(held)) if held else ())
             prev = seen.get(key)
