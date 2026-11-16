@@ -109,6 +109,11 @@ def setup(fwdir, ucode, initvals=(), phy_type=0x2):
         shm[base + 7] |= 0x100          # B43_QOSPARAM_STATUS: updated
     shm[HOSTF1] |= HF_EDCF
     chip.spr_write(SPR_IFS_CTL, chip.m.spr.get(SPR_IFS_CTL, 0) | IFSCTL_USE_EDCF)
+    # Retry limits as b43_chip_init() writes them: short 7 and long 4 in the
+    # scratch registers 6 and 7 (B43_SHM_SC_SRLIMIT/LRLIMIT), the fallback
+    # limits in SHM 0x44/0x46 (B43_SHM_SH_SFFBLIM/LFFBLIM).
+    chip.m.reg[6], chip.m.reg[7] = 7, 4
+    shm[0x44 >> 1], shm[0x46 >> 1] = 3, 2
     # MACCMD's DFQ_VALID, which the initvals set (and b43-next on the AC);
     # fwmatrix's op stream writes MACCMD whole. The ucode
     # sends from its FIFOs only with it set (OpenFWWF's ready_for_header_copy).

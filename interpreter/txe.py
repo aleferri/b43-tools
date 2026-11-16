@@ -67,7 +67,7 @@ FIFOS = 8
 
 @dataclass
 class TxStatus:
-    words: tuple                # (XMITSTAT_0, XMITSTAT_1)
+    words: tuple                # (XMITSTAT_0, XMITSTAT_1); corerev 40+: XMITSTAT_0..3 twice
     clock: int
 
 
@@ -183,3 +183,227 @@ class TxEngine:
         else:
             self.log.append((c.clock, f"FIFO {fifo} skip {len(chunk)} bytes"))
         self.pos += len(chunk)
+
+
+# ---- corerev 40 and later ----
+# Names from Broadcom's d11.h (the corerev 40+ register block, as published
+# in its GPL source drops): SPR n is MMIO 0x400 + 2n.
+SPR_TXE40_FIFO = 0x0A4          # BMCCmd
+BMC_UPDATE_BA = 0x0080          # BMCCmd_UpdateBA
+BMC_CONSUME = 0x0100            # BMCCmd_Consume
+BMC_AGGREGATE = 0x0200          # BMCCmd_Aggregate: the next frame handed over
+BMC_GO = 0x8000                 # with UpdateBA/Consume (no d11.h name)
+SPR_TXE40_MPDU_GO = 0x0B8       # PSM-only (a gap in the host map): 0x000a per MPDU
+SPR_TXE40_CMD, SPR_TXE40_OFFSET, SPR_TXE40_COUNT, SPR_TXE40_SHM = 0x093, 0x094, 0x095, 0x097
+TXE40_GO, TXE40_FROM_OFFSET, TXE40_SENDING = 0x8000, 0x0080, 0x0400
+SPR_TXE40_DESCS = 0x0BC         # txe_status1; ucode42 sends only with it at 2 or more (0x0229)
+# the aggregation queue manager
+SPR_AQM_RCVDBA = 0x203          # AQMRcvdBA0..3: a block ack bitmap, 64 bits
+SPR_AQM_BASSN, SPR_AQM_REFSN = 0x207, 0x208
+SPR_AQM_UPDBA = 0x216           # AQMUpdBA0..3
+SPR_AQM_ACKCNT, SPR_AQM_CONSCNT = 0x21A, 0x21B
+SPR_TXE40_FIFO_RDY = 0x21C      # AQMFifoReady
+SPR_TXE40_SEND, TXE40_SEND_FRAME = 0x320, 0x8001   # a queued frame (0x8000 alone: the beacon)
+SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA = 0x08C, 0x08D
+STAT40_NEXT = 0x0080            # the next package of a status entry
+TOE_LEN = 4                     # b43_txhdr_ac's offload header
+AC_TXH_LEN = 128                # b43_txhdr_ac, the offload header included
+AIFS_US = 16 + 2 * 9            # SIFS and AIFSN 2 short slots; no backoff modelled
+ACK_TIMEOUT_US = 16 + 9 + 25    # SIFS, a slot and the PHY's RX start delay
+COND_TX_NOW, COND_RX_RSPTMOUT = 0x20, 0x23
+WATCHED40 = (SPR_TXE40_FIFO, SPR_TXE40_CMD, SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA, SPR_TXE40_SEND,
+             SPR_TXE40_MPDU_GO)
+
+
+class TxEngine40(TxEngine):
+    """The corerev 40+ engine as far as ucode42 drives it, a model of what it
+    reads and writes for single frames and A-MPDUs:
+
+    - BMCCmd (SPR 0x0A4) picks the FIFO in bits 3:0; Aggregate hands the next
+      frame over to the aggregation queue manager. A write of SPR 0x093 with
+      bit 15 copies SPR 0x095 bytes of a frame, from offset 0 or with bit 7
+      from the byte offset in SPR 0x094, to shared memory at byte address
+      SPR 0x097: of the next frame to hand over, or with bit 10 of the one
+      handed over last. COND_TX_BUSY while it lasts.
+    - AIFS after a hand-over COND_TX_NOW; the ucode starts each MPDU with
+      SPR 0x320 = 0x8001 (vchip's TX_SERIAL raises TX_POWER and TX_DONE),
+      for a VHT PPDU or an A-MPDU after a write of SPR 0x0B8, which clears
+      when done (answered at once). A unicast frame with no PLCP received
+      within the ACK timeout after its end: COND_RX_RSPTMOUT (0x23, counted in
+      macstat rxrsptmout). The hardware's own retries and rate fallback are
+      not modelled.
+    - The response goes to the aggregation queue manager (aqm_update()), then
+      the ucode writes the TX status to SPR 0x08C/0x08D (close_entry())."""
+
+    def __init__(self, chip):
+        super().__init__(chip)
+        self.fetched = [0] * FIFOS  # frames of each FIFO handed over
+        self.package = None         # the status package being written, 1 or 2
+        self.slot = 0               # its next 16-bit slot
+        self.halves = [None] * 16   # the status entry, two packages of 8 halves
+        self.ack_due = None         # clock by which the sent frame's ACK must start
+        self.ack_rx = 0             # RX engine log entries before that send
+        self.marked = [set() for _ in range(FIFOS)]  # in-flight MPDUs a response acknowledged
+        self.acked = 0              # the MPDUs the last block ack update acknowledged, a bitmap
+        self.tried = 0              # the MPDUs in flight at the last consume
+
+    def publish(self):
+        spr = self.chip.m.spr
+        rdy, waiting = 0, 0
+        for n, q in enumerate(self.fifos):
+            left = len(q) - self.fetched[n]
+            if left > 0:
+                rdy |= 1 << n
+                waiting += left
+        # the frames not yet handed over: after one is, the ucode's scheduler
+        # would otherwise take the same frame again
+        spr[SPR_TXE40_FIFO_RDY] = spr.get(SPR_TXE40_FIFO_RDY, 0) & ~0xFF | rdy
+        # a hypothesis: the DMA descriptors waiting, two a frame (header, body)
+        spr[SPR_TXE40_DESCS] = 2 * waiting
+
+    def next_clock(self):
+        due = [t for t in (self.busy_until, self.ack_due) if t is not None]
+        return min(due) if due else None
+
+    def tick(self):
+        super().tick()
+        c = self.chip
+        if self.ack_due is not None and c.clock >= self.ack_due:
+            self.ack_due = None
+            if not any(e == "plcp" for _, e in c.rxe.log[self.ack_rx:]):
+                c.events.add(COND_RX_RSPTMOUT)
+                c.napping = False
+                self.log.append((c.clock, "no ACK: response timeout"))
+
+    def service(self, n, value):
+        c = self.chip
+        spr = c.m.spr
+        if n == SPR_TXE40_SEND:
+            q = self.fifos[self.cur] if self.cur is not None else None
+            # from the end of the last MPDU of the PPDU
+            if value == TXE40_SEND_FRAME and q \
+                    and len(q[0]) > AC_TXH_LEN + 4 \
+                    and not q[0][AC_TXH_LEN + 4] & 1 and c.mhz:
+                done = c.tx[2] if c.tx else 0
+                self.ack_due = c.clock + done + ACK_TIMEOUT_US * c.mhz
+                self.ack_rx = len(c.rxe.log)
+            return
+        if n == SPR_TXE40_MPDU_GO:
+            if value:
+                spr[SPR_TXE40_MPDU_GO] = 0
+            return
+        if n == SPR_TXE40_FIFO:
+            self.cur = value & 0xF
+            if value & (BMC_UPDATE_BA | BMC_CONSUME):
+                self.aqm_update(self.cur, value & BMC_CONSUME)
+                spr[SPR_TXE40_FIFO] = value & ~(BMC_GO | BMC_UPDATE_BA | BMC_CONSUME)
+            if value & BMC_AGGREGATE:
+                spr[SPR_TXE40_FIFO] = spr.get(SPR_TXE40_FIFO, value) & ~BMC_AGGREGATE
+                if self.fetched[self.cur] < len(self.fifos[self.cur]):
+                    self.fetched[self.cur] += 1
+                self.publish()
+                self.log.append((c.clock, f"FIFO {self.cur} frame handed over"))
+                if c.tx and c.mhz:
+                    c.pending.append((c.steps + AIFS_US * c.mhz, COND_TX_NOW))
+            return
+        if n == SPR_TXSTAT40_CMD:
+            # bit 7: the next package, written from 16-bit slot (bits 2:0)
+            # down; without it slot 0 of the same package
+            if value & STAT40_NEXT:
+                self.package = (self.package or 0) + 1
+            self.slot = value & 7
+            return
+        if n == SPR_TXSTAT40_DATA:
+            if not self.package or self.package > 2 or self.slot < 0:
+                return
+            self.halves[8 * (self.package - 1) + self.slot] = value & 0xFFFF
+            self.slot -= 1
+            if self.package == 2 and self.slot < 0:
+                self.close_entry()
+            return
+        if n != SPR_TXE40_CMD or not value & TXE40_GO:
+            return
+        q = self.fifos[self.cur] if self.cur is not None and self.cur < FIFOS else []
+        if not q:
+            return
+        start = spr.get(SPR_TXE40_OFFSET, 0) if value & TXE40_FROM_OFFSET else 0
+        count = spr.get(SPR_TXE40_COUNT, 0)
+        k = self.fetched[self.cur] - 1 if value & TXE40_SENDING else self.fetched[self.cur]
+        # the offload header is not in what the ucode copies: it reads the
+        # chanspec 6 bytes in (0x02B3)
+        frame = q[max(0, min(k, len(q) - 1))][TOE_LEN:]
+        chunk = frame[start:start + count]
+        shm = c.m.shm
+        addr = spr.get(SPR_TXE40_SHM, 0)
+        for i in range(0, len(chunk), 2):
+            w = chunk[i] | (chunk[i + 1] << 8 if i + 1 < len(chunk) else 0)
+            shm[((addr + i) >> 1) & (len(shm) - 1)] = w
+        self.busy_until = c.clock + c.rxe._clock(1 + len(chunk) / COPY_BYTES_PER_US)
+        self.log.append((c.clock, f"FIFO {self.cur} [{start}:+{count}] -> SHM {addr:#06x}, "
+                                  f"command {value:#06x}"))
+
+    def aqm_update(self, fifo, consume):
+        """BMCCmd UpdateBA: mark the in-flight MPDUs the block ack bitmap in
+        AQMRcvdBA0..3 acknowledges, bit i for sequence AQMBaSSN + i and MPDU k
+        of the FIFO at AQMRefSN + k (ucode42 writes the bitmap of a block ack
+        with its SSN and the first MPDU's, and for an ACK bit 0 with both 0);
+        AQMAckCnt and AQMUpdBA0..3 report them. With Consume the marked MPDUs
+        leave the FIFO and AQMConsCnt counts them (after a block ack or none,
+        ucode42 consumes with every bit set). Only the MPDUs a response
+        acknowledged go; without one, all in flight go."""
+        c = self.chip
+        spr = c.m.spr
+        bitmap = 0
+        for i in range(4):
+            bitmap |= spr.get(SPR_AQM_RCVDBA + i, 0) << 16 * i
+        ssn, ref = spr.get(SPR_AQM_BASSN, 0), spr.get(SPR_AQM_REFSN, 0)
+        hit = {k for k in range(self.fetched[fifo])
+               if (ref + k - ssn) & 0xFFF < 64 and bitmap >> ((ref + k - ssn) & 0xFFF) & 1}
+        if not consume:
+            self.marked[fifo] |= hit
+            upd = sum(1 << k for k in hit)
+            self.acked = upd
+            spr[SPR_AQM_ACKCNT] = len(hit)
+            for i in range(4):
+                spr[SPR_AQM_UPDBA + i] = upd >> 16 * i & 0xFFFF
+            return
+        # after a response the MPDUs it acknowledged go, the rest stay for a
+        # retry (the real statuses count only those in AQMConsCnt); with none
+        # every MPDU in flight goes, as after the hardware's last retry
+        gone = self.marked[fifo] or hit
+        self.tried = self.fetched[fifo]
+        n = 0
+        for k in sorted(gone, reverse=True):
+            if k < len(self.fifos[fifo]):
+                self.fifos[fifo].pop(k)
+                n += 1
+        # the ones left are offered again, to go out in the next A-MPDU
+        self.fetched[fifo] = 0
+        self.marked[fifo] = set()
+        spr[SPR_AQM_CONSCNT] = n
+        self.publish()
+        self.log.append((c.clock, f"FIFO {fifo}: {n} MPDU(s) consumed"))
+
+    def close_entry(self):
+        """A TX status entry: the two packages b43-next reads from
+        XMITSTAT_0..3 (b43_txstatus_read_ac()). The ucode writes word 0
+        (frame ID << 16 | status: the MPDU count from SPR 0x21B in bits 14:8,
+        ACKED bit 15), word 1 (the sequence number) and the second package's
+        last word; the attempt and acknowledged counts of word 2, the second
+        package's first word and the block ack bitmap are the hardware's, here
+        for one attempt with the acknowledged count of the last block ack
+        update. 269 of the 297 real corerev 42 statuses (BCM4352) are of that
+        form; the rest are the hardware's retries and fallback."""
+        c = self.chip
+        h = [x or 0 for x in self.halves]
+        self.package, self.halves = None, [None] * 16
+        w = [h[2 * i] | h[2 * i + 1] << 16 for i in range(8)]
+        mpdus = w[0] >> 8 & 0x7F
+        bitmap = self.acked if w[0] & 0x8000 else 0
+        self.acked = 0
+        w[2] = bin(bitmap).count("1") << 8 | max(self.tried, mpdus)
+        self.tried = 0
+        w[3] = 0
+        w[4], w[5], w[6] = 1, bitmap & 0xFFFFFFFF, bitmap >> 32
+        self.status.append(TxStatus(tuple(w), c.clock))
+        self.log.append((c.clock, "TX status " + " ".join(f"{x:08x}" for x in w)))

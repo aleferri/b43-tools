@@ -274,9 +274,12 @@ class Chip:
         self.raised_at = {}             # event -> step it was first seen raised
         self.tested_at = {}             # selector -> step of its last jext/jnext
         self.rxe = rxe.RxEngine(self)
-        self.txe = txe.TxEngine(self) if hw.corerev < 40 else None
-        if self.txe is not None:
+        if hw.corerev < 40:
+            self.txe = txe.TxEngine(self)
             self.watched |= set(txe.WATCHED)
+        else:
+            self.txe = txe.TxEngine40(self)
+            self.watched |= set(txe.WATCHED40)
         self.watched |= {rxe.SPR_RXE_FIFOCTL1, rxe.SPR_RXE_LOOKUP40}
 
     def spr_write(self, n, val):
@@ -646,7 +649,7 @@ class Chip:
             self.hw_dirty = True
             if n == rxe.SPR_RXE_LOOKUP40 and new & 1:
                 self.rxe.lookup_due = True
-            elif self.txe is not None and n in txe.WATCHED:
+            elif n in (txe.WATCHED40 if self.hw.corerev >= 40 else txe.WATCHED):
                 self.txe.writes.append((n, new))
         if self.recording:
             self.recorder.store(loc, old, new)
