@@ -145,6 +145,11 @@ CORECTL = SprFollow(spr=0x078, request=0x0020, ack=0x2000)
 # real headers.
 CRYPT_GO = SprSelfClear(spr=0x1E0, bits=0x8000)
 
+# SPR 0x1F0 bit 2: a command the ucode gives with an address from the TX
+# header in SPR 0x1F2..0x1F4, then waits for the bit to clear (ucode30_mimo
+# 0x02BC/0x02CC, ucode11 0x023D; ucode42 waits on it too). Answered at once.
+ADDR_CMD = SprSelfClear(spr=0x1F0, bits=0x0004)
+
 # Up to corerev 30: TX_COUNT bytes of template RAM to the serializer.
 TX_TEMPLATE = SprTrigger(spr=0x0B4, bits=0x0826)
 # From corerev 40: 0x8001 for a queued frame, 0x8000 for the beacon.
@@ -156,13 +161,13 @@ AGGFIFODATA0_GO = HostTaken(spr=0x098, bits=0x8000)
 
 _PROFILES = (
     ((5, 14), Core(corerev=5, isa=psm5, buses=(PHY_D11,),
-                   handshakes=(RXE_SUSPEND, CRYPT_GO), tx_go=TX_TEMPLATE,
+                   handshakes=(RXE_SUSPEND, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
                    read_from=(5, 11))),
     ((15, 39), Core(corerev=22, isa=psm15, buses=(PHY_D11, RADIO),
-                    handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO), tx_go=TX_TEMPLATE,
+                    handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
                     read_from=(16, 22, 24, 26, 29, 30))),
     ((40, None), Core(corerev=42, isa=psm15, buses=(PHY_GO, RADIO),
-                      handshakes=(RXE_SUSPEND, CORECTL), tx_go=TX_SERIAL,
+                      handshakes=(RXE_SUSPEND, CORECTL, ADDR_CMD), tx_go=TX_SERIAL,
                       read_from=(40, 42),
                       host_regs=(XMTFIFOCMD_BUSY, AGGFIFODATA0_GO))),
 )
