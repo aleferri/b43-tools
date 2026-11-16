@@ -321,6 +321,16 @@ FCS, is dropped, also in a sequence of frames (--then):
     ./rxframe.py openfwwf ucode5 --initvals openfwwf/b0g0initvals5.fw \
         --initvals openfwwf/b0g0bsinitvals5.fw
 
+`txe.py` is the chip's TX FIFOs before corerev 40: a frame given to
+`tx_frame()` is what the host's DMA queues (TX header, then the frame), the
+ucode moves its bytes with SPR_TXE0_SELECT and reports its TX status in
+SPR_TX_STATUS0..3. `txframe.py` replays a TX header and frame b43-next
+queued, taken from a capture, with b43-next's host side (rxframe.setup()),
+and prints what the ucode sent and the status it gave; `--ack` answers
+the frame with an ACK:
+
+    ./txframe.py fw/b43 ucode30_mimo capture.txt --index 3 --ack
+
 `ucode_init.py` runs just the version-stamp prologue and dumps the shared
 memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
 `cond.py`, the jext/jnext conditions a blob tests:
