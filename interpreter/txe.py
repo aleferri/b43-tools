@@ -63,6 +63,13 @@ WATCHED = (SPR_TXE0_FIFO_CMD, SPR_TXE0_SELECT, SPR_TX_STATUS0)
 COND_TX_BUSY = 0x2F             # OpenFWWF's COND_TX_BUSY
 COPY_BYTES_PER_US = 400         # FIFO to shared memory, a model
 FIFOS = 8
+TXH_MAC_ACK = 0x01              # b43_txhdr mac_ctl: an immediate ACK wanted (pre-40)
+# no ACK within SIFS + a slot + the PHY's RX start delay after the end of a
+# frame that wants one: COND_RX_RSPTMOUT (0x23; the ucode counts it in
+# macstat rxrsptmout, d11.h; OpenFWWF's COND_TX_PMQ). The hardware's own
+# retries are not modelled.
+ACK_TIMEOUT_US = 16 + 9 + 25
+COND_RX_RSPTMOUT = 0x23
 
 
 @dataclass
@@ -82,6 +89,8 @@ class TxEngine:
         self.status = []            # TxStatus
         self.log = []               # (clock, event)
         self.writes = []            # (spr, value) of the ucode, to serve
+        self.ack_due = None         # clock by which the sent frame's ACK must start
+        self.ack_rx = 0             # RX engine log entries before that send
 
     # ---- the host side ----
     def tx_frame(self, fifo, data):
@@ -108,11 +117,28 @@ class TxEngine:
         return self.busy_until is not None
 
     def next_clock(self):
-        return self.busy_until
+        due = [t for t in (self.busy_until, self.ack_due) if t is not None]
+        return min(due) if due else None
 
     def tick(self):
-        if self.busy_until is not None and self.chip.clock >= self.busy_until:
+        c = self.chip
+        if self.busy_until is not None and c.clock >= self.busy_until:
             self.busy_until = None
+        if self.ack_due is not None and c.clock >= self.ack_due:
+            self.ack_due = None
+            if not any(e == "plcp" for _, e in c.rxe.log[self.ack_rx:]):
+                c.events.add(COND_RX_RSPTMOUT)
+                c.napping = False
+                self.log.append((c.clock, "no ACK: response timeout"))
+
+    def ack_wait(self):
+        """A frame that wants an ACK went out: the response timeout from its
+        end (OpenFWWF: the ACK timeout's expiry raises 0x23)."""
+        c = self.chip
+        if c.mhz:
+            done = c.tx[2] if c.tx else 0
+            self.ack_due = c.clock + done + ACK_TIMEOUT_US * c.mhz
+            self.ack_rx = len(c.rxe.log)
 
     def held(self):
         return {COND_TX_BUSY} if self.busy_until is not None else set()
@@ -175,6 +201,8 @@ class TxEngine:
             self.log.append((c.clock, f"FIFO {fifo} -> SHM {addr:#06x}, {len(chunk)} bytes"))
         elif dst == SELECT_DST_PHY:
             self.sent.append((c.clock, fifo, bytes(chunk)))
+            if frame[0] & TXH_MAC_ACK:
+                self.ack_wait()
             if c.tx:
                 _ifs, start, done = c.tx
                 c.pending.append((c.steps + start, 0x21))   # COND_TX_POWER
@@ -209,8 +237,7 @@ STAT40_NEXT = 0x0080            # the next package of a status entry
 TOE_LEN = 4                     # b43_txhdr_ac's offload header
 AC_TXH_LEN = 128                # b43_txhdr_ac, the offload header included
 AIFS_US = 16 + 2 * 9            # SIFS and AIFSN 2 short slots; no backoff modelled
-ACK_TIMEOUT_US = 16 + 9 + 25    # SIFS, a slot and the PHY's RX start delay
-COND_TX_NOW, COND_RX_RSPTMOUT = 0x20, 0x23
+COND_TX_NOW = 0x20
 WATCHED40 = (SPR_TXE40_FIFO, SPR_TXE40_CMD, SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA, SPR_TXE40_SEND,
              SPR_TXE40_MPDU_GO)
 
@@ -241,8 +268,6 @@ class TxEngine40(TxEngine):
         self.package = None         # the status package being written, 1 or 2
         self.slot = 0               # its next 16-bit slot
         self.halves = [None] * 16   # the status entry, two packages of 8 halves
-        self.ack_due = None         # clock by which the sent frame's ACK must start
-        self.ack_rx = 0             # RX engine log entries before that send
         self.marked = [set() for _ in range(FIFOS)]  # in-flight MPDUs a response acknowledged
         self.acked = 0              # the MPDUs the last block ack update acknowledged, a bitmap
         self.tried = 0              # the MPDUs in flight at the last consume
@@ -261,20 +286,6 @@ class TxEngine40(TxEngine):
         # a hypothesis: the DMA descriptors waiting, two a frame (header, body)
         spr[SPR_TXE40_DESCS] = 2 * waiting
 
-    def next_clock(self):
-        due = [t for t in (self.busy_until, self.ack_due) if t is not None]
-        return min(due) if due else None
-
-    def tick(self):
-        super().tick()
-        c = self.chip
-        if self.ack_due is not None and c.clock >= self.ack_due:
-            self.ack_due = None
-            if not any(e == "plcp" for _, e in c.rxe.log[self.ack_rx:]):
-                c.events.add(COND_RX_RSPTMOUT)
-                c.napping = False
-                self.log.append((c.clock, "no ACK: response timeout"))
-
     def service(self, n, value):
         c = self.chip
         spr = c.m.spr
@@ -284,9 +295,7 @@ class TxEngine40(TxEngine):
             if value == TXE40_SEND_FRAME and q \
                     and len(q[0]) > AC_TXH_LEN + 4 \
                     and not q[0][AC_TXH_LEN + 4] & 1 and c.mhz:
-                done = c.tx[2] if c.tx else 0
-                self.ack_due = c.clock + done + ACK_TIMEOUT_US * c.mhz
-                self.ack_rx = len(c.rxe.log)
+                self.ack_wait()
             return
         if n == SPR_TXE40_MPDU_GO:
             if value:
