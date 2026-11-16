@@ -43,9 +43,10 @@ Conditions: COND_TRUE, COND_MACEN from MACCONTROL.ENABLED, condition register
 4 (0x40..0x4F) from SPR_BRC, 5 (0x50..0x5F) from SPR_PSM_COND; with a TX
 engine (IFS, START, DONE in instructions) COND_TX_NOW after bit 0 of
 SPR_TXE0_CTL, COND_TX_POWER and COND_TX_DONE after the profile's tx_go; with
-the TSF running COND_TX_TBTTEXPIRE at each TBTT. Each is held until the
-ucode's EOI; every other condition is false. The TX engine is a model, not a
-known semantic.
+the TSF running COND_TX_TBTTEXPIRE at each TBTT; the receive conditions of
+the frames given to rx_frame() (rxe.py). Each is held until the ucode's EOI,
+but those rxe.py holds for as long as their cause lasts; every other
+condition is false. The TX and RX engines are models, not known semantics.
 
 nap stops the PSM, unless an event was raised since the ucode last tested it
 (the main loop tests the events in turn and naps at its end, so one raised
@@ -69,6 +70,7 @@ advance() does not run an idle PSM again until the host writes.
 import struct
 
 import psmlib
+import rxe
 
 MACCTL, MACCMD, IRQ_REASON, IRQ_MASK = 0x120, 0x124, 0x128, 0x12C
 MACCTL_ENABLED, MACCTL_PSM_RUN, MACCTL_PSM_JMP0 = 0x1, 0x2, 0x4
@@ -270,6 +272,8 @@ class Chip:
         self.flags_key = None
         self.raised_at = {}             # event -> step it was first seen raised
         self.tested_at = {}             # selector -> step of its last jext/jnext
+        self.rxe = rxe.RxEngine(self)
+        self.watched |= {rxe.SPR_RXE_FIFOCTL1, rxe.SPR_RXE_LOOKUP40}
 
     def spr_write(self, n, val):
         self.m.spr[n] = val & 0xFFFF
@@ -543,7 +547,7 @@ class Chip:
     def next_event_clock(self):
         """The clock of the next TBTT or nap timeout, or None."""
         due = [c for c in (self.tbtt_due_clock(), self.nap_until if self.napping else None,
-                           *self.gpt_due) if c is not None]
+                           *self.gpt_due, self.rxe.next_clock()) if c is not None]
         return min(due) if due else None
 
     def tsf_set_word(self, i, val):
@@ -571,7 +575,8 @@ class Chip:
         """The external conditions, for a jext/jnext."""
         brc = self.m.spr.get(SPR_BRC, 0)
         psm = self.m.spr.get(SPR_PSM_COND, 0)
-        key = (self.macctl & MACCTL_ENABLED, brc, psm, tuple(sorted(self.events)) if self.events else ())
+        held = self.events | self.rxe.levels if self.rxe.levels else self.events
+        key = (self.macctl & MACCTL_ENABLED, brc, psm, tuple(sorted(held)) if held else ())
         if key == self.flags_key:
             return
         self.flags_key = key
@@ -579,7 +584,7 @@ class Chip:
         for bit in range(16):
             flags[CONDREG_BRC | bit] = bool(brc >> bit & 1)
             flags[CONDREG_PSM | bit] = bool(psm >> bit & 1)
-        for sel in self.events:
+        for sel in held:
             flags[sel] = True
         self.m.ext_flags = flags
 
@@ -597,6 +602,7 @@ class Chip:
                 self.tbtt_align()
             else:
                 self.next_tbtt = None
+        self.rxe.tick()
         if self.pending:
             due = [p for p in self.pending if p[0] <= self.steps]
             for p in due:
@@ -624,6 +630,8 @@ class Chip:
             self.gpt_write(GPT_STAT[n], final)
         if kind == "spr" and n in self.watched:
             self.hw_dirty = True
+            if n == rxe.SPR_RXE_LOOKUP40 and new & 1:
+                self.rxe.lookup_due = True
         if self.recording:
             self.recorder.store(loc, old, new)
         if final != old:
@@ -684,6 +692,7 @@ class Chip:
                 answer = hs.respond(value)
                 if answer != value:
                     m.store(("spr", hs.spr), answer)
+            self.rxe.service()
         if self.inits_state == "due":
             self.write_inits()
         return True
@@ -733,7 +742,7 @@ class Chip:
         if any(self.raised_at[e] >= self.tested_at.get(e, -1) for e in self.events):
             return          # an event raised since the ucode last tested it
         self.napping = True
-        self.nap_events = frozenset(self.events)
+        self.nap_events = frozenset(self.events | self.rxe.levels)
         max_nap = self.m.spr.get(SPR_MAX_NAP, 0)
         if self.nap_us is not None:
             max_nap = min(max_nap, self.nap_us) if max_nap else self.nap_us
@@ -747,7 +756,7 @@ class Chip:
         self.raise_events()
         if not self.napping:
             return False
-        if self.pending or not self.events <= self.nap_events or \
+        if self.pending or not (self.events | self.rxe.levels) <= self.nap_events or \
                 (self.nap_until is not None and self.clock >= self.nap_until):
             self.napping = False
             return False
@@ -799,10 +808,11 @@ class Chip:
                 return self.steps - start, m.pc
             if epoch != self.host_epoch:
                 seen, epoch = {}, self.host_epoch
+            held = self.events | self.rxe.levels if self.rxe.levels else self.events
             key = (m.pc, tuple(m.call_stack), m.carry,
-                   tuple(sorted(self.events)) if self.events else ())
+                   tuple(sorted(held)) if held else ())
             prev = seen.get(key)
-            if prev is not None and not self.pending and \
+            if prev is not None and not self.pending and not self.rxe.receiving() and \
                     (len(self.changes) == prev[1] or
                      self.state_hash == prev[2] and self.unchanged_since(prev[1])):
                 if self.clock_read_at < prev[0]:

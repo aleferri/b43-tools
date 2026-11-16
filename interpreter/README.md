@@ -308,6 +308,19 @@ PHY. STATUS.md has its results on the DSL-3580_EU driver.
 
     ./fwmatrix.py fw/b43 --dasm ../disassembler/b43-dasm
 
+`rxe.py` is the chip's receive engine: a frame given to `rx_frame()` reaches
+shared memory and raises the receive conditions, and the ucode's push puts
+its RX header and the frame in a FIFO. `rxframe.py` receives frames after
+fwmatrix's beacon setup and prints the SHM counters that moved (brcmsmac's
+struct macstat from word 0x70). With every 784.2 ucode (6.30.163.46 driver)
+that has initvals, and with OpenFWWF, a data frame for the station is pushed
+with an RX header and acknowledged; one for another station, or with a bad
+FCS, is dropped, also in a sequence of frames (--then):
+
+    ./rxframe.py fw/b43 ucode42
+    ./rxframe.py openfwwf ucode5 --initvals openfwwf/b0g0initvals5.fw \
+        --initvals openfwwf/b0g0bsinitvals5.fw
+
 `ucode_init.py` runs just the version-stamp prologue and dumps the shared
 memory the ucode writes (UCODEREV/PATCH/...); `extcond_scan.py` lists, named via
 `cond.py`, the jext/jnext conditions a blob tests:
