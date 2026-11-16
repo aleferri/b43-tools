@@ -138,6 +138,13 @@ RXE_SUSPEND = SprSelfClear(spr=0x004, bits=0x0004)
 # brcmsmac's psm_corectlsts: the arch15 ucode sets bit 5, waits for bit 13.
 CORECTL = SprFollow(spr=0x078, request=0x0020, ack=0x2000)
 
+# Up to corerev 39, SPR 0x1E0: every command the ucode writes has bit 15 set
+# (0x01xx, 0x11xx, 0x83xx, 0x87xx), and after COND_RX_CRYPTBUSY it copies bit
+# 15 to the RX header's B43_RX_MAC_DECERR (ucode30_mimo 0x0A1B, ucode11
+# 0x07FC). Cleared at once: the engine done, no error, as on the BCM43217's
+# real headers.
+CRYPT_GO = SprSelfClear(spr=0x1E0, bits=0x8000)
+
 # Up to corerev 30: TX_COUNT bytes of template RAM to the serializer.
 TX_TEMPLATE = SprTrigger(spr=0x0B4, bits=0x0826)
 # From corerev 40: 0x8001 for a queued frame, 0x8000 for the beacon.
@@ -149,10 +156,10 @@ AGGFIFODATA0_GO = HostTaken(spr=0x098, bits=0x8000)
 
 _PROFILES = (
     ((5, 14), Core(corerev=5, isa=psm5, buses=(PHY_D11,),
-                   handshakes=(RXE_SUSPEND,), tx_go=TX_TEMPLATE,
+                   handshakes=(RXE_SUSPEND, CRYPT_GO), tx_go=TX_TEMPLATE,
                    read_from=(5, 11))),
     ((15, 39), Core(corerev=22, isa=psm15, buses=(PHY_D11, RADIO),
-                    handshakes=(RXE_SUSPEND, CORECTL), tx_go=TX_TEMPLATE,
+                    handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO), tx_go=TX_TEMPLATE,
                     read_from=(16, 22, 24, 26, 29, 30))),
     ((40, None), Core(corerev=42, isa=psm15, buses=(PHY_GO, RADIO),
                       handshakes=(RXE_SUSPEND, CORECTL), tx_go=TX_SERIAL,
