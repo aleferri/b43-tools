@@ -47,7 +47,10 @@ the TSF running COND_TX_TBTTEXPIRE at each TBTT. Each is held until the
 ucode's EOI; every other condition is false. The TX engine is a model, not a
 known semantic.
 
-nap stops the PSM until a condition not raised when it stopped, a host write,
+nap stops the PSM, unless an event was raised since the ucode last tested it
+(the main loop tests the events in turn and naps at its end, so one raised
+during the pass would otherwise wait for the next wake-up), until a
+condition not raised when it stopped, a host write,
 a TX engine condition on its way, the expiry of a TSF general-purpose timer
 (GPT0..2: STAT bit 15 arms it for CNT ticks, or VAL if CNT is zero, at 8 MHz
 with bit 14 else 88 MHz; CNT reads as the ticks left), or SPR_MAC_MAX_NAP
@@ -265,6 +268,8 @@ class Chip:
         self.changes = []               # (loc, old) of state changes in this settle
         self.state_hash = 0             # xor of hash((loc, value)) over ucode writes
         self.flags_key = None
+        self.raised_at = {}             # event -> step it was first seen raised
+        self.tested_at = {}             # selector -> step of its last jext/jnext
 
     def spr_write(self, n, val):
         self.m.spr[n] = val & 0xFFFF
@@ -650,6 +655,8 @@ class Chip:
             self.clock_read_at = self.steps
         if is_ext:
             self.conditions()
+            self.stamp_events()
+            self.tested_at[ins.extra["imm"] & 0x7F] = self.steps
         if self.recording:
             for spr in sprs:
                 if spr not in m.spr and spr not in self.host_spr:
@@ -712,7 +719,19 @@ class Chip:
                 left = max(0, int((due - self.clock) / self.mhz * self.gpt_rate[i]))
                 spr[GPTS[i][1]], spr[GPTS[i][2]] = left & 0xFFFF, left >> 16 & 0xFFFF
 
+    def stamp_events(self):
+        """The step at which each raised event was first seen raised."""
+        stamps = self.raised_at
+        if len(stamps) != len(self.events) or any(e not in stamps for e in self.events):
+            for e in [e for e in stamps if e not in self.events]:
+                del stamps[e]
+            for e in self.events:
+                stamps.setdefault(e, self.steps)
+
     def nap(self):
+        self.stamp_events()
+        if any(self.raised_at[e] >= self.tested_at.get(e, -1) for e in self.events):
+            return          # an event raised since the ucode last tested it
         self.napping = True
         self.nap_events = frozenset(self.events)
         max_nap = self.m.spr.get(SPR_MAX_NAP, 0)
