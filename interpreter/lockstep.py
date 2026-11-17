@@ -31,7 +31,8 @@ The ops map onto the chip's host side:
 
 The captures do not carry the initvals: --initvals gives them to the chip.
 --corerev picks the profile (default 42), --tx-engine IFS,START,DONE and
---psm-mhz F turn on the TX engine model and the running TSF.
+--psm-mhz F turn on the TX engine model and the running TSF, --bus-latency N
+makes each PHY and radio transaction take N instructions.
 
 The host's reads come from its own trace (the oracle the trace was made
 with), so the ucode does not feed back into the host here: what this measures
@@ -42,13 +43,13 @@ Input lines are `cpuN CLASS key=val ...` (test/integration) or
 
 With --settle the report adds a timetable in PSM instructions: how long the
 ucode works after each host operation, when it raises IRQ bits, and which
-shared-memory words it wrote that the host reads later. Bus transactions
-complete at once here, so the counts of code that waits on them are lower
-bounds.
+shared-memory words it wrote that the host reads later. Without
+--bus-latency bus transactions complete at once, so the counts of code that
+waits on them are lower bounds.
 
     lockstep.py OPS BLOB [--cycles 100 | --settle MAX] [--initvals FILE ...]
                 [--tx-engine IFS,START,DONE] [--psm-mhz F]
-                [--corerev N] [--phy-ver V]
+                [--corerev N] [--phy-ver V] [--bus-latency N]
                 [--report FILE] [--cond-inc FILE]
 """
 
@@ -122,12 +123,13 @@ class Recorder(vchip.Recorder):
 
 class Lockstep:
     def __init__(self, prog, cycles, settle=None, inits=None, tx=None, mhz=None,
-                 hw=core.for_corerev(42), phy_ver=None):
+                 hw=core.for_corerev(42), phy_ver=None, bus_latency=0):
         self.rec = Recorder()
         devices = None
         if phy_ver is not None:
             devices = {"phy": vchip.RegisterFile("phy", {0: phy_ver & 0xFFFF})}
-        self.chip = vchip.Chip(prog, hw, devices, inits, tx, mhz, self.rec)
+        self.chip = vchip.Chip(prog, hw, devices, inits, tx, mhz, self.rec,
+                               bus_latency=bus_latency)
         self.rec.chip = self.chip
         self.prog = prog
         self.cycles = cycles
@@ -294,6 +296,8 @@ def main():
     ap.add_argument("--phy-ver", type=lambda x: int(x, 0), metavar="V",
                     help="PHY register 0, as MMIO PHY_VER reads (analog << 12 | "
                          "type << 8 | revision), instead of the trace's")
+    ap.add_argument("--bus-latency", type=int, default=0, metavar="N",
+                    help="PSM instructions a PHY or radio transaction takes (a model)")
     ap.add_argument("--report")
     ap.add_argument("--cond-inc", help="OpenFWWF cond.inc, to name the selectors")
     args = ap.parse_args()
@@ -308,7 +312,7 @@ def main():
     tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
     hw = core.for_corerev(args.corerev)
     ls = Lockstep(hw.isa.load_program(args.blob), args.cycles, args.settle, inits, tx,
-                  args.psm_mhz, hw, args.phy_ver)
+                  args.psm_mhz, hw, args.phy_ver, args.bus_latency)
     ls.feed(args.ops)
     out = open(args.report, "w") if args.report else sys.stdout
     ls.report(out, label)

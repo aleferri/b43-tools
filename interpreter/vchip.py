@@ -12,8 +12,9 @@
 #   GNU General Public License for more details.
 """A virtual D11 chip: the PSM running the real ucode and the hardware around
 it, shared by host and ucode. It knows a core revision only through its
-core.py profile, and PHY and radio only as devices (RegisterFile) with what
-the board gives them: the PHY version word, the radio's identity registers.
+core.py profile, PHY and radio only as devices (RegisterFile, devices.py)
+with what the board gives them: the PHY version word, the radio's identity
+registers, and the way to them only as the profile's protocols (buses.py).
 
 Host MMIO, as b43 uses it:
   0x160/0x164/0x166  object window. Control word routing << 16 | offset in
@@ -38,7 +39,8 @@ Any other register reads back what was written; reads of it are counted.
 Initvals go through the MMIO when the ucode first raises MAC_SUSPENDED after
 PSM_RUN, as brcms_b_coreinit writes them.
 
-The ucode reaches the profile's buses, a transaction completing at once.
+The ucode reaches the profile's buses, a transaction taking bus_latency
+instructions (0: it completes after the one that issued it).
 Conditions: COND_TRUE, COND_MACEN from MACCONTROL.ENABLED, condition register
 4 (0x40..0x4F) from SPR_BRC, 5 (0x50..0x5F) from SPR_PSM_COND; with a TX
 engine (IFS, START, DONE in instructions) COND_TX_NOW after bit 0 of
@@ -69,6 +71,7 @@ advance() does not run an idle PSM again until the host writes.
 
 import struct
 
+import buses
 import psmlib
 import rxe
 import txe
@@ -211,7 +214,8 @@ class Recorder:
 
 class Chip:
     def __init__(self, prog, hw, devices=None, inits=None, tx=None, mhz=None,
-                 recorder=None, phy_version=None, skip_time_waits=False, nap_us=None):
+                 recorder=None, phy_version=None, skip_time_waits=False, nap_us=None,
+                 bus_latency=0):
         self.prog = prog
         self.hw = hw
         self.devices = {name: RegisterFile(name) for name in
@@ -219,8 +223,13 @@ class Chip:
         self.devices.update(devices or {})
         for dev in self.devices.values():
             dev.now = self.us
-        self.phy = self.devices["phy"]
         self.radio = self.devices["radio"]
+        self.phy = self.devices["phy"]
+        if hw.four_wire:
+            self.phy = buses.FourWireBus(hw.four_wire, self.phy, self.radio)
+        reach = dict(self.devices, phy=self.phy)
+        self.buses = [buses.SprBus(bus, reach[bus.name], bus_latency) for bus in hw.buses]
+        self.bus_busy = False           # a transaction still running
         self.phy_version = phy_version
         if phy_version is not None:
             self.phy.seed(0, phy_version)
@@ -701,11 +710,7 @@ class Chip:
             self.nap()
         if self.hw_dirty:
             self.hw_dirty = False
-            for bus in self.hw.buses:
-                cmd = m.spr.get(bus.addr_spr, 0)
-                kind = bus.command.command(cmd)
-                if kind:
-                    self.transfer(bus, cmd, kind)
+            self.service_buses()
             for hs in self.hw.handshakes:
                 value = m.spr.get(hs.spr, 0)
                 answer = hs.respond(value)
@@ -714,6 +719,8 @@ class Chip:
             self.rxe.service()
             if self.txe is not None:
                 self.txe.service_all()
+        elif self.bus_busy:
+            self.service_buses()
         if self.inits_state == "due":
             self.write_inits()
         return True
@@ -792,23 +799,19 @@ class Chip:
         gpt = any(s in GPT_STAT or s in GPT_CNT for s in sprs)
         return tsf, others, ins.mnem in ("jext", "jnext"), ins.mnem == "nap", gpt
 
-    def transfer(self, bus, cmd, kind):
-        m = self.m
-        dev = self.devices[bus.name]
-        addr = cmd & bus.command.addr_mask
-        if kind == "read":
-            src = "host" if dev.known(addr) else "never set"
-            if dev.waiting():
+    def service_buses(self):
+        busy = False
+        for bus in self.buses:
+            done = bus.tick(self.m)
+            busy = busy or bus.pending is not None
+            if done is None:
+                continue
+            kind, addr, val, src, timed = done
+            if timed:
                 self.clock_read_at = self.steps
-            val = dev.read(addr)
-            m.store(("spr", bus.data_spr), val)
-        else:
-            src = "ucode"
-            val = m.spr.get(bus.data_spr, 0)
-            dev.write(addr, val)
-        if self.recording:
-            self.recorder.bus(bus.name, kind, addr, val, src)
-        m.store(("spr", bus.addr_spr), bus.command.complete(cmd))
+            if self.recording:
+                self.recorder.bus(bus.spec.name, kind, addr, val, src)
+        self.bus_busy = busy
 
     def run(self, n):
         for _ in range(n):
@@ -833,7 +836,8 @@ class Chip:
             key = (m.pc, tuple(m.call_stack), m.carry,
                    tuple(sorted(held)) if held else ())
             prev = seen.get(key)
-            if prev is not None and not self.pending and not self.rxe.receiving() and \
+            if prev is not None and not self.pending and not self.bus_busy and \
+                    not self.rxe.receiving() and \
                     (len(self.changes) == prev[1] or
                      self.state_hash == prev[2] and self.unchanged_since(prev[1])):
                 if self.clock_read_at < prev[0]:

@@ -16,7 +16,9 @@ the others (STATUS.md).
 
   isa         psm5 up to corerev 14, psm15 from 15 (b43-asm's %arch mapping)
   buses       address/command SPR and data SPR of each indirect register
-              interface, named after the device behind it
+              interface, named after the device behind it (buses.SprBus)
+  four_wire   the PHY registers through which the ucode reaches the radio
+              where it has no bus of its own (buses.FourWireBus)
   handshakes  SPR bits the ucode sets and waits on, answered at once
   tx_go       the SPR write that launches a prepared frame
   host_regs   IHR registers that answer host accesses on their own
@@ -34,9 +36,11 @@ import psm15
 class BusCommand:
     """A command with all `read` bits set reads the register into the data
     SPR; one with all `write` bits set (and not a read) writes the data SPR
-    to it."""
+    to it. `busy` reads as set until the transaction completes, which clears
+    the command bits."""
     read: int
     write: int
+    busy: int
     addr_mask: int
 
     def command(self, cmd):
@@ -47,7 +51,7 @@ class BusCommand:
         return None
 
     def complete(self, cmd):
-        return cmd & ~(self.read | self.write)
+        return cmd & ~(self.read | self.write | self.busy)
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,13 @@ class IndirectBus:
     addr_spr: int
     data_spr: int
     command: BusCommand
+
+
+@dataclass(frozen=True)
+class FourWire:
+    """PHY registers in front of the radio: the radio register, its data."""
+    addr: int
+    data: int
 
 
 @dataclass(frozen=True)
@@ -120,18 +131,23 @@ class Core:
     tx_go: SprTrigger
     read_from: tuple        # corerevs whose ucode this profile was read from
     host_regs: tuple = ()
+    four_wire: FourWire = None
     assumed: bool = False
 
 
-# OpenFWWF's sel_phy_reg/write_phy_reg: bit 12 reads, bit 13 writes.
-CMD_D11 = BusCommand(read=0x1000, write=0x2000, addr_mask=0x0FFF)
-# Bit 14 starts a transaction, bit 13 makes it a read.
-CMD_GO = BusCommand(read=0x6000, write=0x4000, addr_mask=0x1FFF)
+# OpenFWWF's sel_phy_reg/write_phy_reg: bit 12 reads, bit 13 writes; every
+# access first waits for bit 14 to clear.
+CMD_D11 = BusCommand(read=0x1000, write=0x2000, busy=0x4000, addr_mask=0x0FFF)
+# Bit 14 starts a transaction and clears when it completes, bit 13 makes it
+# a read.
+CMD_GO = BusCommand(read=0x6000, write=0x4000, busy=0x4000, addr_mask=0x1FFF)
 
 PHY_D11 = IndirectBus("phy", 0x018, 0x019, CMD_D11)
 PHY_GO = IndirectBus("phy", 0x018, 0x019, CMD_GO)
-# From corerev 24. That the radio is behind it is inferred (STATUS.md).
+# From corerev 24 (STATUS.md).
 RADIO = IndirectBus("radio", 0x030, 0x031, CMD_D11)
+# Up to corerev 23: b43's B43_NPHY_4WI_ADDR and B43_NPHY_4WI_DATALO.
+FOUR_WIRE = FourWire(addr=0x00B, data=0x00D)
 
 # RXE_FIFOCTL1_SUSPEND, set before a MAC suspend.
 RXE_SUSPEND = SprSelfClear(spr=0x004, bits=0x0004)
@@ -163,12 +179,15 @@ _PROFILES = (
     ((5, 14), Core(corerev=5, isa=psm5, buses=(PHY_D11,),
                    handshakes=(RXE_SUSPEND, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
                    read_from=(5, 11))),
-    ((15, 39), Core(corerev=22, isa=psm15, buses=(PHY_D11, RADIO),
+    ((15, 23), Core(corerev=22, isa=psm15, buses=(PHY_D11,),
                     handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
-                    read_from=(16, 22, 24, 26, 29, 30))),
+                    read_from=(16, 22), four_wire=FOUR_WIRE)),
+    ((24, 39), Core(corerev=24, isa=psm15, buses=(PHY_D11, RADIO),
+                    handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
+                    read_from=(24, 26, 29, 30))),
     ((40, None), Core(corerev=42, isa=psm15, buses=(PHY_GO, RADIO),
                       handshakes=(RXE_SUSPEND, CORECTL, ADDR_CMD), tx_go=TX_SERIAL,
-                      read_from=(40, 42),
+                      read_from=(40, 42, 49),
                       host_regs=(XMTFIFOCMD_BUSY, AGGFIFODATA0_GO))),
 )
 

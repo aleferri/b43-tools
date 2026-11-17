@@ -26,6 +26,7 @@ selector found here is a lead to read in the listing, not a semantic.
     condfuzz.py OPS BLOB TARGET [--with SEL ...] [--blocking] [--steps N]
                 [--initvals FILE ...] [--tx-engine IFS,START,DONE]
                 [--psm-mhz F] [--settle MAX] [--corerev N] [--phy-ver V]
+                [--bus-latency N]
                 [--cond-inc FILE]
 """
 
@@ -68,6 +69,7 @@ def main():
     ap.add_argument("--cond-inc")
     ap.add_argument("--corerev", type=int, default=42)
     ap.add_argument("--phy-ver", type=lambda x: int(x, 0), metavar="V")
+    ap.add_argument("--bus-latency", type=int, default=0, metavar="N")
     args = ap.parse_args()
 
     label = lambda sel: ""
@@ -79,7 +81,7 @@ def main():
     tx = tuple(int(x, 0) for x in args.tx_engine.split(",")) if args.tx_engine else None
     hw = core.for_corerev(args.corerev)
     ls = lockstep.Lockstep(hw.isa.load_program(args.blob), 100, args.settle,
-                           inits, tx, args.psm_mhz, hw, args.phy_ver)
+                           inits, tx, args.psm_mhz, hw, args.phy_ver, args.bus_latency)
     ls.feed(args.ops)
     chip = ls.chip
     if not chip.running:

@@ -63,15 +63,17 @@ class Device(vchip.RegisterFile):
                 tuple(b.snapshot() for b in dict.fromkeys(self.owner.values())))
 
 
-class TablePortSplit:
+class TablePort:
     """Tables reached through an id register, an offset register and data
     ports: a 32-bit cell is written HI then LO, LO storing the cell and
     stepping the offset; a read of LO fetches the cell, steps the offset and
-    latches the high half for HI. The alternate port moves 16 bits a step."""
+    latches the high half for HI. The alternate port moves 16 bits a step.
+    Without an id register the offset register holds the whole address,
+    table << 10 | offset, and steps as one."""
 
-    def __init__(self, id_reg, offset_reg, lo, hi, alt):
+    def __init__(self, id_reg, offset_reg, lo, hi, alt=None):
         self.id_reg, self.offset_reg, self.lo, self.hi, self.alt = id_reg, offset_reg, lo, hi, alt
-        self.registers = (id_reg, offset_reg, lo, hi, alt)
+        self.registers = tuple(r for r in (id_reg, offset_reg, lo, hi, alt) if r is not None)
         self.tables = {}
         self.table_id = self.offset = 0
         self.hi_in = self.hi_out = 0
@@ -207,8 +209,12 @@ class StatusBits:
 
 # PHY types as in PHY_VER bits 11:8 (b43.h's B43_PHYTYPE_*).
 PHY_BEHAVIOURS = {
+    0x04: lambda: [TablePort(None, 0x072, 0x073, 0x074)],                 # N
+    0x05: lambda: [TablePort(None, 0x455, 0x456, 0x457)],                 # LP
+    0x07: lambda: [TablePort(None, 0x072, 0x073, 0x074)],                 # HT
+    0x08: lambda: [TablePort(None, 0x455, 0x456, 0x457)],                 # LCN
     0x0B: lambda: [                                                       # AC
-        TablePortSplit(0x00D, 0x00E, 0x00F, 0x010, 0x011),
+        TablePort(0x00D, 0x00E, 0x00F, 0x010, 0x011),
         BusyBits(0x380, 0x8000, us=200),    # RX AFE calibration: 40 us..1 ms captured
         BusyBits(0x270, 0x0001, us=200),    # RX IQ estimator: up to ~40 busy polls captured
     ],
