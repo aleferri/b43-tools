@@ -177,8 +177,10 @@ with classes such as
 A tool skips the classes it does not use.
 
 `vchip.py` is the virtual chip: the PSM running the real ucode and the
-hardware around it, built from the `core.py` profile of a core revision and
-from PHY and radio devices. Its docstring describes what it models.
+hardware around it, built from the `core.py` profile of a core revision, the
+protocols of `buses.py` through which the ucode reaches PHY and radio, and
+the PHY and radio devices behind them. Its docstring describes what it
+models.
 
 `vchipd.py` serves the chip to a driver over stdin/stdout: the driver
 forwards the D11 core's MMIO and the passing of time, the chip answers the
@@ -193,7 +195,9 @@ reads and says when an interrupt is pending. The board is given by options
     Q                       end                      -> K <irq>
 
 `devices.py` models PHY and radio as register files plus behaviours (table
-ports, busy bits, status bits), chosen by PHY type and radio id. `devcheck.py`
+ports, busy bits, status bits), chosen by PHY type and radio id; the table
+ports of N, HT, LP and LCN follow b43's and brcmsmac's accesses and the
+ucode's, not a capture. `devcheck.py`
 replays the PHY and radio accesses of a capture on them and counts the reads
 they predict right:
 
@@ -227,16 +231,18 @@ The initvals can be brcmsmac's d11init blobs or b43's `.fw` images.
 `--corerev N` (default 42) picks the instruction set and the `core.py`
 profile, per generation:
 
-    corerev  PHY (SPR 0x018/0x019)        radio (0x030)    handshakes           read from
-    5..14    bit 12 read, bit 13 write    -                RXE_FIFOCTL1         5 (OpenFWWF), 11
-    15..39   bit 12 read, bit 13 write    bit 12/13        RXE_FIFOCTL1, 0x078  16, 22, 24, 26, 29, 30
-    40..     bit 14 start, bit 13 read    bit 12/13        RXE_FIFOCTL1, 0x078  40, 42
+    corerev  PHY (SPR 0x018/0x019)             radio                       handshakes           read from
+    5..14    bit 12 read, 13 write, 14 busy    -                           RXE_FIFOCTL1         5 (OpenFWWF), 11
+    15..23   bit 12 read, 13 write, 14 busy    PHY 0x00B/0x00D             RXE_FIFOCTL1, 0x078  16, 22
+    24..39   bit 12 read, 13 write, 14 busy    SPR 0x030/0x031, as PHY     RXE_FIFOCTL1, 0x078  24, 26, 29, 30
+    40..     bit 14 start/busy, 13 read        SPR 0x030/0x031, 12/13/14   RXE_FIFOCTL1, 0x078  40, 42, 49
 
-That the radio is behind SPR 0x030/0x031 is inferred (STATUS.md); up to
-corerev 22 the ucode reaches the radio through the PHY's four-wire
-registers, not modelled. A revision outside a profile's "read from" list is
-reported as assumed. PHY register 0 reads as the trace's MMIO PHY_VER, or as
-`--phy-ver`.
+Up to corerev 23 the radio is behind the PHY's four-wire registers, the
+radio register in 0x00B and its data in 0x00D. A revision outside a
+profile's "read from" list is reported as assumed. `--bus-latency N` makes
+each PHY and radio transaction take N instructions, the busy bit set
+meanwhile; nothing measured gives N, 0 (the default) completes it at once.
+PHY register 0 reads as the trace's MMIO PHY_VER, or as `--phy-ver`.
 
 Condition register 4 follows SPR_BRC bit by bit, as OpenFWWF documents it.
 `--tx-engine IFS,START,DONE` adds the TX engine model described below, with

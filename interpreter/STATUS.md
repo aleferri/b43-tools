@@ -17,6 +17,10 @@ extracts 14 ucode with code in them and their initvals; all report UCODEREV
 `wlc_ucode_write_byte` writes bytes 3..6, then 0..2); fwcutter writes them out
 as they are.
 
+`wlD6220.o_save` of the D6220 driver (md5 ca7d51a97cb0228bb099d15bb20b6704,
+ucode 0x3A0, PATCH 0x2715) is not in `b43-fwcutter`'s list: its ucode and
+initvals are the `d11ucode*` and `d11*initvals*` symbols of the ELF object.
+
 OpenFWWF, built with this fork's `b43-asm` (`jand`/`jnand` swapped in the
 source), is the arch5 ucode for corerev 5.
 
@@ -55,6 +59,21 @@ per microsecond, PHY register 0 as the PHY type of the ucode's name
       idle and runs each host operation to its limit; the ucode still answers
       as the others do.
 
+The same on the D6220 driver:
+
+    ucode               corerev  isa    bytes  instr  vs dasm  initvals          boot  beacons
+    ucode16_lp          16       arch15 8      4217   0        lp0initvals16     yes*  3 of 3
+    ucode16_mimo        16       arch15 8      4920   0        n0initvals16      yes   3 of 3
+    ucode22_mimo        22       arch15 8      4795   0        n0initvals22      yes   3 of 3
+    ucode24_lcn         24       arch15 7      5034   0        lcn0..2initvals24 yes*  3 of 3
+    ucode24_mimo        24       arch15 8      5047   0        n0initvals24      yes   3 of 3
+    ucode26_mimo        26       arch15 8      5012   0        ht0initvals26     yes   3 of 3
+    ucode29_mimo        29       arch15 8      5469   0        ht0initvals29     yes   3 of 3
+    ucode30_mimo        30       arch15 8      5086   0        n16initvals30     yes   3 of 3
+    ucode40             40       arch15 8      5898   0        ac0initvals40     yes   3 of 3
+    ucode42             42       arch15 8      5976   0        ac1initvals42     yes   3 of 3
+    ucode49             49       arch15 8      5968   0        ac9initvals49     yes   3 of 3
+
 OpenFWWF: 0 mismatches against `b43-dasm` on 1190 instructions; boots to its
 idle `nap`; `condfuzz.py` finds COND_RX_COMPLETE as the condition that
 reaches `rx_complete`.
@@ -68,12 +87,17 @@ Hardware read from the ucode
   ucode); bit 14 with bit 13 for a read on 40 and 42. `ucode22_mimo` with the
   corerev 42 commands hangs on its first PHY read. `ucode16_mimo`, `_lp` and
   `_sslpn` access the PHY alike.
-- Radio at SPR 0x030/0x031 from corerev 24, inferred: up to 22 the radio
-  routines go through the N-PHY's four-wire registers 0x0B/0x0D, register in
-  r0, value in r1, skipped while MACCONTROL.RADIOLOCK is set; from 24 the
-  routines at SPR 0x030 take the same r0/r1. The HT ucode writes 0x184,
-  0x584, 0x984 (b43's R2059_C1..C3 core offsets); the LCN one reaches 0x033,
-  0x112, 0x113 (registers of brcmsmac's radio 2064).
+- Radio: up to 22 the radio routines, of every PHY, go through the PHY's
+  four-wire registers 0x0B/0x0D (b43's B43_NPHY_4WI_ADDR/DATALO), register in
+  r0, value in r1 (8 bits), skipped while MACCONTROL.RADIOLOCK is set; from
+  24 the routines at SPR 0x030/0x031 take the same r0/r1, 16 bits. The HT
+  ucode writes 0x184, 0x584, 0x984 there (b43's R2059_C1..C3 core offsets);
+  the LCN one reaches 0x033, 0x112, 0x113 (registers of brcmsmac's radio
+  2064).
+- PHY tables: the ucode writes table entries in bursts, the address once,
+  then only the data: N and HT through 0x072/0x073/0x074, AC with the table
+  in 0x00D, the offset in 0x00E and the data in 0x00F/0x010, the high half
+  first.
 - Handshakes: every ucode sets bit 2 of SPR_RXE_FIFOCTL1 before a MAC
   suspend and waits for it to clear; the arch15 ones set bit 5 of SPR 0x078
   and wait for bit 13.
@@ -86,8 +110,15 @@ Hardware read from the ucode
 Not modelled, or not known
 --------------------------
 
-- The radio's registers read as written, else 0; the four-wire access
-  through the PHY is not connected to the radio device.
+- The radio's registers read as written, else 0.
+- PHY tables have no width: an entry is the low data register with the high
+  one latched, as b43 and brcmsmac access them; no table holds initial
+  values, and the SSLPN, LCNXN and LCN40 PHYs have no table interface. Only
+  a PHY made by `devices.phy_device` (vchipd, devcheck) has them: lockstep,
+  and so fwmatrix, gives the PHY a plain register file.
+- How long a bus transaction takes: `--bus-latency` is a model parameter,
+  and whether bit 14 also covers an N-generation write the ucode does not
+  wait for is the model's reading of the ucode, not a measurement.
 - PHY registers the hardware updates (e.g. 0x05B0 read by the sslpn ucode,
   0x0235 by `ucode30_mimo`) read as written, else 0.
 - The PHY revision: `fwmatrix.py` gives the type only.
@@ -96,6 +127,6 @@ Not modelled, or not known
 - External conditions other than COND_TRUE, COND_MACEN, the TX engine's,
   the TBTT and condition register 4 stay false; their names are OpenFWWF's.
 - arch5: nothing measured on hardware.
-- Revisions other than 5, 11, 16, 22, 24, 26, 29, 30, 40, 42: profile of
+- Revisions other than 5, 11, 16, 22, 24, 26, 29, 30, 40, 42, 49: profile of
   their generation, reported as assumed. Corerev 4 and earlier: no
   instruction set.
