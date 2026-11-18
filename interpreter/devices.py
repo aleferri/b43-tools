@@ -50,6 +50,10 @@ class Device(vchip.RegisterFile):
         else:
             super().observe(addr, value)
 
+    def latch(self, addr, bits=0):
+        b = self.owner.get(addr)
+        return b.latch(bits) if isinstance(b, WriteOneClear) else None
+
     def waiting(self):
         return any(b.waiting() for b in dict.fromkeys(self.owner.values()))
 
@@ -207,6 +211,41 @@ class StatusBits:
         return self.value
 
 
+class WriteOneClear:
+    """A register whose bits the hardware sets (latch()) and a write of 1
+    clears."""
+
+    def __init__(self, reg):
+        self.reg = reg
+        self.registers = (reg,)
+        self.value = None
+
+    def write(self, addr, value):
+        self.value = (self.value or 0) & ~value
+
+    def read(self, addr):
+        return self.value or 0
+
+    def known(self, addr):
+        return self.value is not None
+
+    def observe(self, addr, value):
+        self.value = value
+
+    def latch(self, bits):
+        self.value = (self.value or 0) | bits
+        return self.value
+
+    def waiting(self):
+        return False
+
+    def next_change(self):
+        return None
+
+    def snapshot(self):
+        return self.value
+
+
 # PHY types as in PHY_VER bits 11:8 (b43.h's B43_PHYTYPE_*).
 PHY_BEHAVIOURS = {
     0x04: lambda: [TablePort(None, 0x072, 0x073, 0x074)],                 # N
@@ -217,6 +256,7 @@ PHY_BEHAVIOURS = {
         TablePort(0x00D, 0x00E, 0x00F, 0x010, 0x011),
         BusyBits(0x380, 0x8000, us=200),    # RX AFE calibration: 40 us..1 ms captured
         BusyBits(0x270, 0x0001, us=200),    # RX IQ estimator: up to ~40 busy polls captured
+        WriteOneClear(0x007),               # TX errors (txe.py), measured on the RT-AC56U
     ],
 }
 
