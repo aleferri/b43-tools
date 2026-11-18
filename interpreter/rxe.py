@@ -327,10 +327,9 @@ class RxEngine:
         data = self.frame.data
         while self.copied < limit:
             i = self.copied & ~1
-            lo = data[i] if i < len(data) else 0
-            hi = data[i + 1] if i + 1 < len(data) else 0
-            shm[(base + i // 2) & (len(shm) - 1)] = lo | hi << 8
-            self.copied = i + 2
+            end = min(i + 2, limit)
+            shm[(base + i // 2) & (len(shm) - 1)] = int.from_bytes(data[i:end], "little")
+            self.copied = end
 
     # ---- the ucode side ----
     def amt(self):
