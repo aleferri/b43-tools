@@ -28,9 +28,11 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
   + plcp_us   COND_RX_PLCP, held until the EOI.
               SPR_RXE_STATUS bit 12; without it the ucode counts the frame in
               SHM 0x0AE and flushes it (ucode30_mimo 0x0795, ucode42 0x0806).
-              Bit 13 until the frame's end; the LP ucode aborts a reception
-              with bit 12 and not bit 13 after 14 us (ucode16_lp 0x0ED1), a
-              hypothesis.
+              Bit 13 until the last byte is in the RX buffer, COPY_LAG_US
+              after the frame's end: the end condition comes with it still
+              set, as on the RT-AC56U (spr.inc's SPR_RXE_0x1a). The LP ucode
+              aborts a reception with bit 12 and not bit 13 after 14 us
+              (ucode16_lp 0x0ED1), a hypothesis.
               SPR_RXE_ENCODING bit 13 for OFDM, and on arch15 bits 10..12 the
               frame format the ucode tells 0..3 apart by (ucode29_mimo
               0x07E5; 0 makes it CCK): 1 for OFDM.
@@ -42,7 +44,11 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               COND_RX_RAMATCH and COND_RX_BSSMATCH as given, while the frame
               lasts (before corerev 40).
   then        the bytes arrive at an even rate and reach the RX buffer
-              COPY_LAG_US later; SPR_RXE_FRAMELEN counts the ones there, and
+              COPY_LAG_US later; SPR_RXE_FRAMELEN counts the ones there (on
+              corerev 30 up to 2 short of the frame: the RX header length
+              the ucode takes from it at the push is 2 short of the PLCP's on
+              the RT-AC56U; that the last 2 bytes are never counted is a
+              hypothesis), and
               the first SPR_RXE_COPY_LEN of them are in shared memory from
               word SPR_RXE_COPY_OFFSET, from the next word with the HT and AC
               PHY (copy_lead()). The lag: the HT ucode clears the first two
@@ -95,6 +101,8 @@ From corerev 40 the ucode needs more:
     control sub-band (SHM 0x50, 0x0A84).
   - SPR 0x263 bit 12 from the frame's end to the next PLCP: ucode42 waits
     for it before it takes COND_RX_COMPLETE (0x095F), and after the push.
+  - SPR 0x290 bit 0: without it a push reaches no RX DMA ring (RT-AC56U);
+    ucode42 sets it (0x0D03).
   - SPR 0x293 counts the PLCPs: ucode42 puts its bits 0..5 in bits 10..15
     of RX header word 9 (0x0A3F), bits that grow from frame to frame on the
     routers.
@@ -133,6 +141,8 @@ PHY_RXSUBBANDS40 = 0x143        # AC-PHY register, bits 12..15
 STAT40_DONE = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
+SPR_RXE_DMA40, DMA40_ON = 0x290, 0x0001
+FRAMELEN_SHORT = {30: 2}        # corerev: bytes SPR_RXE_FRAMELEN never counts
 STATUS_COPIED, STATUS_PLCP, STATUS_DATA = 0x4000, 0x1000, 0x2000
 ENCODING_OFDM = 0x2000
 PLCP_LEN = 6
@@ -174,7 +184,8 @@ class RxEngine:
         self.frame = None
         self.queue = []             # (clock, RxFrame) still to start
         self.t_plcp = self.t_end = None
-        self.received = 0           # bytes counted in SPR_RXE_FRAMELEN
+        self.received = 0           # bytes the PHY handed over
+        self.held = 0               # bytes in the RX buffer
         self.copied = 0             # bytes copied to shared memory
         self.levels = set()         # conditions held while the frame lasts
         self.complete = False
@@ -195,7 +206,8 @@ class RxEngine:
 
     def receiving(self):
         """A frame is on the air: what the ucode polls may still change."""
-        return self.frame is not None and (not self.complete or not self.copy_done())
+        return self.frame is not None and \
+            (not self.complete or self.held < len(self.frame.data) or not self.copy_done())
 
     def busy(self):
         return bool(self.queue) or self.frame is not None or self.fifo_busy_until is not None
@@ -205,7 +217,7 @@ class RxEngine:
         c = self.chip
         due = [self.fifo_busy_until] if self.fifo_busy_until is not None else []
         if self.frame is not None:
-            if self.received < len(self.frame.data) or not self.copy_done():
+            if self.held < len(self.frame.data) or not self.copy_done():
                 return c.clock + 1
         elif self.queue:
             due.append(self.queue[0][0])
@@ -226,7 +238,7 @@ class RxEngine:
             start, f = self.queue.pop(0)
             air = f.air_us if f.air_us is not None else \
                 f.plcp_us + 4 * ((len(f.data) - PLCP_LEN) * 8 + 22 + 23) // 24
-            self.frame, self.received, self.copied = f, 0, 0
+            self.frame, self.received, self.held, self.copied = f, 0, 0, 0
             self.t_plcp = start + self._clock(f.plcp_us)
             self.t_end = start + self._clock(air)
             self.levels = self.levels & {COND_RX_FIFOBUSY}
@@ -274,12 +286,16 @@ class RxEngine:
         want = self.arrived(c.clock)
         if want > self.received:
             self.received = want
-        held = self.arrived(c.clock - self._clock(COPY_LAG_US))
-        if held != spr.get(SPR_RXE_FRAMELEN):
-            spr[SPR_RXE_FRAMELEN] = held
+        n = len(f.data)
+        self.held = held = self.arrived(c.clock - self._clock(COPY_LAG_US))
+        framelen = min(held, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+        if framelen != spr.get(SPR_RXE_FRAMELEN):
+            spr[SPR_RXE_FRAMELEN] = framelen
         self.copy(held)
+        if held == n and spr.get(SPR_RXE_STATUS, 0) & STATUS_DATA:
+            spr[SPR_RXE_STATUS] &= ~STATUS_DATA
         mark = spr.get(SPR_RXE_MARK, 0)
-        if mark != self.marked and held >= mark and not self.complete:
+        if mark != self.marked and framelen >= mark and not self.complete:
             self.marked = mark
             if mark:
                 c.events.add(COND_RX_COMPLETE)
@@ -290,7 +306,6 @@ class RxEngine:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
         if c.clock >= self.t_end and not self.complete:
             self.complete = True
-            spr[SPR_RXE_STATUS] &= ~STATUS_DATA
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
             c.napping = False
@@ -417,8 +432,11 @@ class RxEngine:
     def deliver(self, hdr, pad):
         c = self.chip
         size = len(hdr) + len(self.frame.data)
-        self.fifo.append(Pushed(hdr, pad, self.frame.data, c.clock, self.frame))
-        self.log.append((c.clock, "push"))
+        if c.hw.corerev >= 40 and not c.m.spr.get(SPR_RXE_DMA40, 0) & DMA40_ON:
+            self.log.append((c.clock, "push, no RX DMA: SPR 0x290 bit 0 clear"))
+        else:
+            self.fifo.append(Pushed(hdr, pad, self.frame.data, c.clock, self.frame))
+            self.log.append((c.clock, "push"))
         self.end()
         self.levels.add(COND_RX_FIFOBUSY)
         self.fifo_busy_until = c.clock + self._clock(1 + size / FIFO_BYTES_PER_US)
