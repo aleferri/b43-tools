@@ -101,6 +101,9 @@ Hardware read from the ucode
 - Handshakes: every ucode sets bit 2 of SPR_RXE_FIFOCTL1 before a MAC
   suspend and waits for it to clear; the arch15 ones set bit 5 of SPR 0x078
   and wait for bit 13.
+- RX byte count: every ucode writes 6 to SPR 0x02A at COND_RX_PLCP, waits
+  for an EOI of condition 0x06, then writes bits 0..11 of SPR 0x02B there;
+  0 at the frame's end.
 - TX launch: 0x0826 in SPR_TXE0_SELECT after the template pointer and
   TX_COUNT up to corerev 30 (OpenFWWF: "select TX_Count bytes from template
   ram, put into serializer and generate EOF"); SPR 0x320 with bit 15 on 40

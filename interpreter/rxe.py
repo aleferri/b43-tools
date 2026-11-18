@@ -47,13 +47,16 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               word SPR_RXE_COPY_OFFSET, from the next word with the HT and AC
               PHY (copy_lead()). The lag: the HT ucode clears the first two
               PLCP words of the copy at COND_RX_PLCP (ucode29_mimo 0x07F1)
-              and reads the length from them after the frame's end; ucode11
-              reads the header once FRAMELEN reaches 0x26 (0x064C).
+              and reads the length from them once six bytes are there;
+              ucode11 reads the header once FRAMELEN reaches 0x26 (0x064C).
+              SPR 0x02A (spr.inc's SPR_RXE_0x54), if not zero:
+              COND_RX_COMPLETE, held until its EOI, once FRAMELEN reaches it
+              (ucode30_mimo 0x079D..0x07A8, 0x07CD; ucode42 0x080A..0x080E,
+              0x0832). A hypothesis.
               SPR_RXE_STATUS bit 14 once all of the copy is there and the
               frame has ended.
   + air_us    COND_RX_COMPLETE, raised while the frame is in the RX buffer and
-              latched until its EOI besides: ucode42 acknowledges it (0x080D)
-              and tests it again (0x083A). COND_RX_FCS_GOOD, held until the
+              latched until its EOI besides. COND_RX_FCS_GOOD, held until the
               EOI, if the FCS is good.
 
 The PLCP and the end of a frame wake a napping PSM even when their
@@ -117,6 +120,7 @@ SPR_RXE_FRAMELEN, SPR_RXE_STATUS, SPR_RXE_ENCODING = 0x00C, 0x00D, 0x00E
 SPR_RXE_PHYRXSTAT2, SPR_RXE_PHYRXSTAT3 = 0x01A, 0x01B
 SPR_RXE_PHYRXSTAT4, SPR_RXE_PHYRXSTAT5 = 0x022, 0x023   # spr.inc's SPR_RXE_0x44/0x46
 SPR_RXE_FC40 = 0x241
+SPR_RXE_MARK = 0x02A            # spr.inc's SPR_RXE_0x54
 SPR_RXE_NEXT = 0x02B            # spr.inc's SPR_RXE_0x56
 NEXT_NONE = 0x8000
 SPR_RXE_STAT40 = 0x263
@@ -174,6 +178,7 @@ class RxEngine:
         self.copied = 0             # bytes copied to shared memory
         self.levels = set()         # conditions held while the frame lasts
         self.complete = False
+        self.marked = 0             # the SPR_RXE_MARK the frame's bytes reached last
         self.push_due = None        # (rxhdr, pad) of a push made before the end
         self.lookup_due = False      # a write of command 1 to SPR 0x260
         self.fifo_busy_until = None # clock at which the push's copy ends
@@ -225,7 +230,7 @@ class RxEngine:
             self.t_plcp = start + self._clock(f.plcp_us)
             self.t_end = start + self._clock(air)
             self.levels = self.levels & {COND_RX_FIFOBUSY}
-            self.complete, self.push_due = False, None
+            self.complete, self.marked, self.push_due = False, 0, None
         f = self.frame
         if f is None or c.clock < self.t_plcp:
             return
@@ -273,6 +278,13 @@ class RxEngine:
         if held != spr.get(SPR_RXE_FRAMELEN):
             spr[SPR_RXE_FRAMELEN] = held
         self.copy(held)
+        mark = spr.get(SPR_RXE_MARK, 0)
+        if mark != self.marked and held >= mark and not self.complete:
+            self.marked = mark
+            if mark:
+                c.events.add(COND_RX_COMPLETE)
+                c.napping = False
+                self.log.append((c.clock, f"{mark} bytes"))
         if self.copy_done() and not spr.get(SPR_RXE_STATUS, 0) & STATUS_COPIED \
                 and self.complete:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
