@@ -830,14 +830,13 @@ class Chip:
                 (until is None or self.clock < until):
             if self.asleep():
                 return self.steps - start, m.pc
-            if epoch != self.host_epoch:
+            if epoch != self.host_epoch or self.rxe.receiving():
                 seen, epoch = {}, self.host_epoch
             held = self.held()
             key = (m.pc, tuple(m.call_stack), m.carry,
                    tuple(sorted(held)) if held else ())
             prev = seen.get(key)
             if prev is not None and not self.pending and not self.bus_busy and \
-                    not self.rxe.receiving() and \
                     (len(self.changes) == prev[1] or
                      self.state_hash == prev[2] and self.unchanged_since(prev[1])):
                 if self.clock_read_at < prev[0]:
