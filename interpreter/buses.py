@@ -103,6 +103,9 @@ class FourWireBus:
         else:
             self.radio.observe(radio, value)
 
+    def latch(self, addr, bits=0):
+        return self.phy.latch(addr, bits)
+
     def waiting(self):
         return self.phy.waiting() or self.radio.waiting()
 

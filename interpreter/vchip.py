@@ -44,9 +44,10 @@ instructions (0: it completes after the one that issued it).
 Conditions: COND_TRUE, COND_MACEN from MACCONTROL.ENABLED, condition register
 4 (0x40..0x4F) from SPR_BRC, 5 (0x50..0x5F) from SPR_PSM_COND; with a TX
 engine (IFS, START, DONE in instructions) COND_TX_NOW after bit 0 of
-SPR_TXE0_CTL, COND_TX_POWER and COND_TX_DONE after the profile's tx_go; with
-the TSF running COND_TX_TBTTEXPIRE at each TBTT; the receive conditions of
-the frames given to rx_frame() (rxe.py). Each is held until the ucode's EOI,
+SPR_TXE0_CTL, COND_TX_POWER and COND_TX_DONE after the profile's tx_go, the TX
+errors of txe.py in place of COND_TX_DONE; with the TSF running
+COND_TX_TBTTEXPIRE at each TBTT; the receive conditions of the frames given
+to rx_frame() (rxe.py). Each is held until the ucode's EOI,
 but those rxe.py holds for as long as their cause lasts; every other
 condition is false. The TX and RX engines are models, not known semantics.
 
@@ -155,6 +156,9 @@ class RegisterFile:
       known(addr)                       whether anyone set the register
       seed(addr, value)                 set it unless someone already did
       observe(addr, value)              the value a real device returned
+      latch(addr, bits=0)               set bits the hardware holds until a
+                                        write of 1 clears them; the bits held,
+                                        or None where none are
       snapshot()                        a comparable copy of the state
 
     A model of a PHY or a radio extends it with what its registers do."""
@@ -177,6 +181,9 @@ class RegisterFile:
 
     def observe(self, addr, value):
         self.regs[addr] = value & 0xFFFF
+
+    def latch(self, addr, bits=0):
+        return None
 
     def waiting(self):
         """Whether a read could return something else later with no write."""
@@ -632,7 +639,11 @@ class Chip:
         if self.pending:
             due = [p for p in self.pending if p[0] <= self.steps]
             for p in due:
+                if p not in self.pending:
+                    continue        # dropped by a TX error
                 self.pending.remove(p)
+                if self.txe is not None and not self.txe.due(p[1]):
+                    continue
                 self.events.add(p[1])
                 self.recorder.tx_condition(p[1])
 

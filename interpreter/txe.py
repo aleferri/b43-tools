@@ -39,6 +39,29 @@ FIFO: the TX header in the firmware's format, then the frame.
                  words b43 reads from XMITSTAT_0/1: STATUS1 << 16 | STATUS0,
                  STATUS3 << 16 | STATUS2 (`status`).
 
+Measured black-box on the RT-AC56U (corerev 30 and 42), for every core:
+
+  WEP_CTL        the crypto engine in RX mode (bit 9; corerev 40+: bits 4..8
+                 0x15, 0x0150) during a frame starves the TXE: underflow. The
+                 stock ucode leaves RX mode right after the launch and goes
+                 back to it after COND_TX_DONE (ucode30_mimo 0x040E, 0x0598;
+                 ucode42 0x0471, 0x0604); here a frame underflows when RX mode
+                 is written between COND_TX_POWER and COND_TX_DONE or still
+                 there when COND_TX_DONE comes due.
+  TX errors      AC-PHY register 0x007 latches them, bit 13 underflow, bit 5
+                 another, until a write of 1 clears them; a frame that starts
+                 with one latched faults too. An underflow raises
+                 COND_TX_UNDERFLOW (0x2B): the ucode counts txfunfl of the FIFO
+                 (txtplunfl for a template), reads 0x007 and writes 0xFFFF
+                 there (ucode42 0x00B2, 0x0B21; ucode30_mimo 0x0089, 0x0AFC).
+                 Hypotheses: a frame that faults gets no COND_TX_DONE, and
+                 COND_TX_PHYERR (0x2D, which the main loop tests without an
+                 EOI) is held while bit 5 is latched.
+  TXE0_WM0       the template modifications it enables apply to the frame
+                 handed to the PHY, a queued one too when the ucode leaves it
+                 set after a response; `sent` records it, their effect on the
+                 bytes is not known.
+
 With b43-next's host side (txframe.py: DFQ_VALID in MACCMD, EDCF and its
 queue parameters) every 784.2 ucode before corerev 40 sends the frames
 b43-next queued on a BCM43217 (corerev 30), captured with their TX headers,
@@ -59,10 +82,16 @@ SPR_TXE0_SELECT, SPR_TXE0_TX_COUNT, SPR_TXE0_TX_SHM_ADDR = 0x0B4, 0x0B5, 0x0B6
 FIFO_CMD_TXDONE, FIFO_CMD_COPY = 0x2000, 0x4000
 SELECT_DST, SELECT_DST_SHM, SELECT_DST_PHY, SELECT_DST_DISCARD = 0x3, 0x1, 0x2, 0x3
 SELECT_USE_TXCNT, SELECT_SRC_TRAM = 0x4, 0x0800
-WATCHED = (SPR_TXE0_FIFO_CMD, SPR_TXE0_SELECT, SPR_TX_STATUS0)
 COND_TX_BUSY = 0x2F             # OpenFWWF's COND_TX_BUSY
 COPY_BYTES_PER_US = 400         # FIFO to shared memory, a model
 FIFOS = 8
+SPR_TXE0_CTL, SPR_TXE0_AUX, SPR_TXE0_WM0 = 0x080, 0x081, 0x084
+SPR_WEP_CTL = 0x1E0
+WEP_RX, WEP40_MODE, WEP40_RX = 0x0200, 0x01F0, 0x0150
+PHY_TXERR = 0x007               # AC-PHY: the latched TX errors, write 1 to clear
+TXERR_UNDERFLOW, TXERR_OTHER = 0x2000, 0x0020
+COND_TX_POWER, COND_TX_DONE, COND_TX_UNDERFLOW, COND_TX_PHYERR = 0x21, 0x22, 0x2B, 0x2D
+WATCHED = (SPR_TXE0_FIFO_CMD, SPR_TXE0_SELECT, SPR_TX_STATUS0, SPR_WEP_CTL)
 TXH_MAC_ACK = 0x01              # b43_txhdr mac_ctl: an immediate ACK wanted (pre-40)
 # no ACK within SIFS + a slot + the PHY's RX start delay after the end of a
 # frame that wants one: COND_RX_RSPTMOUT (0x23; the ucode counts it in
@@ -85,12 +114,13 @@ class TxEngine:
         self.cur = None             # FIFO the engine reads
         self.pos = 0                # read position in its first frame
         self.busy_until = None      # clock at which a copy ends
-        self.sent = []              # (clock, fifo, bytes) handed to the PHY
+        self.sent = []              # (clock, fifo, bytes, WM0) handed to the PHY
         self.status = []            # TxStatus
         self.log = []               # (clock, event)
         self.writes = []            # (spr, value) of the ucode, to serve
         self.ack_due = None         # clock by which the sent frame's ACK must start
         self.ack_rx = 0             # RX engine log entries before that send
+        self.flight = False         # COND_TX_POWER raised, COND_TX_DONE not yet
 
     # ---- the host side ----
     def tx_frame(self, fifo, data):
@@ -141,12 +171,51 @@ class TxEngine:
             self.ack_rx = len(c.rxe.log)
 
     def held(self):
-        return {COND_TX_BUSY} if self.busy_until is not None else set()
+        held = {COND_TX_BUSY} if self.busy_until is not None else set()
+        if (self.chip.phy.latch(PHY_TXERR) or 0) & TXERR_OTHER:
+            held.add(COND_TX_PHYERR)
+        return held
+
+    def due(self, sel):
+        """A TX engine condition comes due; False if a TX error takes its
+        place."""
+        if sel == COND_TX_POWER:
+            self.flight = True
+            latched = (self.chip.phy.latch(PHY_TXERR) or 0) & (TXERR_UNDERFLOW | TXERR_OTHER)
+            if latched:
+                self.fault(latched)
+        elif sel == COND_TX_DONE:
+            self.flight = False
+            if self.crypto_rx(self.chip.m.spr.get(SPR_WEP_CTL, 0)):
+                self.fault(TXERR_UNDERFLOW)
+                return False
+        return True
+
+    def crypto_rx(self, wep_ctl):
+        if self.chip.hw.corerev >= 40:
+            return wep_ctl & WEP40_MODE == WEP40_RX
+        return bool(wep_ctl & WEP_RX)
+
+    def fault(self, err):
+        """The frame ends in the TX errors err: no COND_TX_DONE and no
+        response awaited."""
+        c = self.chip
+        c.pending = [p for p in c.pending if p[1] != COND_TX_DONE]
+        self.flight, self.ack_due = False, None
+        c.phy.latch(PHY_TXERR, err)
+        if err & TXERR_UNDERFLOW:
+            c.events.add(COND_TX_UNDERFLOW)
+        c.napping = False
+        self.log.append((c.clock, f"TX error {err:#06x}"))
 
     # ---- the ucode side ----
     def service_all(self):
         while self.writes:
-            self.service(*self.writes.pop(0))
+            n, value = self.writes.pop(0)
+            if n != SPR_WEP_CTL:
+                self.service(n, value)
+            elif self.flight and self.crypto_rx(value):
+                self.fault(TXERR_UNDERFLOW)
 
     def service(self, n, value):
         """A ucode write of a watched SPR."""
@@ -200,7 +269,7 @@ class TxEngine:
             self.busy_until = c.clock + c.rxe._clock(1 + len(chunk) / COPY_BYTES_PER_US)
             self.log.append((c.clock, f"FIFO {fifo} -> SHM {addr:#06x}, {len(chunk)} bytes"))
         elif dst == SELECT_DST_PHY:
-            self.sent.append((c.clock, fifo, bytes(chunk)))
+            self.sent.append((c.clock, fifo, bytes(chunk), spr.get(SPR_TXE0_WM0, 0)))
             if frame[0] & TXH_MAC_ACK:
                 self.ack_wait()
             if c.tx:
@@ -221,7 +290,6 @@ BMC_UPDATE_BA = 0x0080          # BMCCmd_UpdateBA
 BMC_CONSUME = 0x0100            # BMCCmd_Consume
 BMC_AGGREGATE = 0x0200          # BMCCmd_Aggregate: the next frame handed over
 BMC_GO = 0x8000                 # with UpdateBA/Consume (no d11.h name)
-SPR_TXE40_MPDU_GO = 0x0B8       # PSM-only (a gap in the host map): 0x000a per MPDU
 SPR_TXE40_CMD, SPR_TXE40_OFFSET, SPR_TXE40_COUNT, SPR_TXE40_SHM = 0x093, 0x094, 0x095, 0x097
 TXE40_GO, TXE40_FROM_OFFSET, TXE40_SENDING = 0x8000, 0x0080, 0x0400
 SPR_TXE40_DESCS = 0x0BC         # txe_status1; ucode42 sends only with it at 2 or more (0x0229)
@@ -238,8 +306,9 @@ TOE_LEN = 4                     # b43_txhdr_ac's offload header
 AC_TXH_LEN = 128                # b43_txhdr_ac, the offload header included
 AIFS_US = 16 + 2 * 9            # SIFS and AIFSN 2 short slots; no backoff modelled
 COND_TX_NOW = 0x20
+TXE40_AUX_MODE, TXE40_AUX_BLOCK = 0x00E0, 0x00C0  # 0x0060 from the initvals sends
 WATCHED40 = (SPR_TXE40_FIFO, SPR_TXE40_CMD, SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA, SPR_TXE40_SEND,
-             SPR_TXE40_MPDU_GO)
+             SPR_WEP_CTL)
 
 
 class TxEngine40(TxEngine):
@@ -252,10 +321,14 @@ class TxEngine40(TxEngine):
       from the byte offset in SPR 0x094, to shared memory at byte address
       SPR 0x097: of the next frame to hand over, or with bit 10 of the one
       handed over last. COND_TX_BUSY while it lasts.
-    - AIFS after a hand-over COND_TX_NOW; the ucode starts each MPDU with
+    - AIFS after a hand-over COND_TX_NOW, only with bit 0 of TXE0_CTL set
+      (0x4001) and not with TXE_AUX bits 5..7 at corerev 30's 0x00C0, which
+      blocks TX on the RT-AC56U where the initvals' 0x0060 sends; at which
+      step the hardware stops is not known. The ucode starts each MPDU with
       SPR 0x320 = 0x8001 (vchip's TX_SERIAL raises TX_POWER and TX_DONE),
-      for a VHT PPDU or an A-MPDU after a write of SPR 0x0B8, which clears
-      when done (answered at once). A unicast frame with no PLCP received
+      for a VHT PPDU or an A-MPDU after a write of SPR 0x0B8, which the
+      hardware leaves as written (the ucode tests its bits 0 and 3,
+      0x04CA, 0x05FA). A unicast frame with no PLCP received
       within the ACK timeout after its end: COND_RX_RSPTMOUT (0x23, counted in
       macstat rxrsptmout). The hardware's own retries and rate fallback are
       not modelled.
@@ -292,14 +365,12 @@ class TxEngine40(TxEngine):
         if n == SPR_TXE40_SEND:
             q = self.fifos[self.cur] if self.cur is not None else None
             # from the end of the last MPDU of the PPDU
+            if value == TXE40_SEND_FRAME and q:
+                self.log.append((c.clock, f"FIFO {self.cur} -> PHY, WM0 {spr.get(SPR_TXE0_WM0, 0):#06x}"))
             if value == TXE40_SEND_FRAME and q \
                     and len(q[0]) > AC_TXH_LEN + 4 \
                     and not q[0][AC_TXH_LEN + 4] & 1 and c.mhz:
                 self.ack_wait()
-            return
-        if n == SPR_TXE40_MPDU_GO:
-            if value:
-                spr[SPR_TXE40_MPDU_GO] = 0
             return
         if n == SPR_TXE40_FIFO:
             self.cur = value & 0xF
@@ -312,7 +383,9 @@ class TxEngine40(TxEngine):
                     self.fetched[self.cur] += 1
                 self.publish()
                 self.log.append((c.clock, f"FIFO {self.cur} frame handed over"))
-                if c.tx and c.mhz:
+                aux = spr.get(SPR_TXE0_AUX, 0)
+                if c.tx and c.mhz and spr.get(SPR_TXE0_CTL, 0) & 1 \
+                        and aux & TXE40_AUX_MODE != TXE40_AUX_BLOCK:
                     c.pending.append((c.steps + AIFS_US * c.mhz, COND_TX_NOW))
             return
         if n == SPR_TXSTAT40_CMD:
