@@ -297,18 +297,24 @@ SPR_TXE40_DESCS = 0x0BC         # txe_status1; ucode42 sends only with it at 2 o
 SPR_AQM_RCVDBA = 0x203          # AQMRcvdBA0..3: a block ack bitmap, 64 bits
 SPR_AQM_BASSN, SPR_AQM_REFSN = 0x207, 0x208
 SPR_AQM_UPDBA = 0x216           # AQMUpdBA0..3
+SPR_AQM_AGGPARAMS = 0x20B       # AQMAggParams: MPDUs less one in 5:0
+SPR_AQM_AGGSTATS = 0x210        # AQMAggStats: MPDUs in 6:0, a reason in 15:13
+SPR_AQM_AGGLEN = 0x211          # AQMAggLenLow, AQMAggLenHi in 0x212
 SPR_AQM_ACKCNT, SPR_AQM_CONSCNT = 0x21A, 0x21B
 SPR_TXE40_FIFO_RDY = 0x21C      # AQMFifoReady
 SPR_TXE40_SEND, TXE40_SEND_FRAME = 0x320, 0x8001   # a queued frame (0x8000 alone: the beacon)
 SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA = 0x08C, 0x08D
 STAT40_NEXT = 0x0080            # the next package of a status entry
 TOE_LEN = 4                     # b43_txhdr_ac's offload header
+TOE_EPOCH = 0x02                # in its byte 2, wl's TOE_F2_EPOCH
+AC_MAC_AMPDU = 0x0040           # b43_txhdr_ac mac_ctl_lo
+SPR_TXE40_LENCALC, SPR_TXE40_LENCALC_OUT = 0x220, 0x225
 AC_TXH_LEN = 128                # b43_txhdr_ac, the offload header included
 AIFS_US = 16 + 2 * 9            # SIFS and AIFSN 2 short slots; no backoff modelled
 COND_TX_NOW = 0x20
 TXE40_AUX_MODE, TXE40_AUX_BLOCK = 0x00E0, 0x00C0  # 0x0060 from the initvals sends
 WATCHED40 = (SPR_TXE40_FIFO, SPR_TXE40_CMD, SPR_TXSTAT40_CMD, SPR_TXSTAT40_DATA, SPR_TXE40_SEND,
-             SPR_WEP_CTL)
+             SPR_TXE40_LENCALC, SPR_WEP_CTL)
 
 
 class TxEngine40(TxEngine):
@@ -316,7 +322,10 @@ class TxEngine40(TxEngine):
     reads and writes for single frames and A-MPDUs:
 
     - BMCCmd (SPR 0x0A4) picks the FIFO in bits 3:0; Aggregate hands the next
-      frame over to the aggregation queue manager. A write of SPR 0x093 with
+      frame over to the aggregation queue manager, which takes the frames
+      after it into its aggregate (aggregate()) and reports them in
+      AQMAggStats and AQMAggLen: without them the ucode sends nothing
+      (0x02F6). A write of SPR 0x093 with
       bit 15 copies SPR 0x095 bytes of a frame, from offset 0 or with bit 7
       from the byte offset in SPR 0x094, to shared memory at byte address
       SPR 0x097: of the next frame to hand over, or with bit 10 of the one
@@ -332,6 +341,11 @@ class TxEngine40(TxEngine):
       within the ACK timeout after its end: COND_RX_RSPTMOUT (0x23, counted in
       macstat rxrsptmout). The hardware's own retries and rate fallback are
       not modelled.
+    - SPR 0x220 bit 0 starts an engine the ucode gives the PLCP words (SPR
+      0x221/0x222) and the aggregate's length (0x223/0x224), and waits for
+      (0x032E) before it reads SPR 0x225 and the PLCP words back. Here it
+      ends at once with the words as written and 0 in SPR 0x225; what it
+      computes is not known.
     - The response goes to the aggregation queue manager (aqm_update()), then
       the ucode writes the TX status to SPR 0x08C/0x08D (close_entry())."""
 
@@ -379,14 +393,18 @@ class TxEngine40(TxEngine):
                 spr[SPR_TXE40_FIFO] = value & ~(BMC_GO | BMC_UPDATE_BA | BMC_CONSUME)
             if value & BMC_AGGREGATE:
                 spr[SPR_TXE40_FIFO] = spr.get(SPR_TXE40_FIFO, value) & ~BMC_AGGREGATE
-                if self.fetched[self.cur] < len(self.fifos[self.cur]):
-                    self.fetched[self.cur] += 1
+                n = self.aggregate(self.cur)
                 self.publish()
-                self.log.append((c.clock, f"FIFO {self.cur} frame handed over"))
+                self.log.append((c.clock, f"FIFO {self.cur} frame handed over, {n} MPDU(s)"))
                 aux = spr.get(SPR_TXE0_AUX, 0)
                 if c.tx and c.mhz and spr.get(SPR_TXE0_CTL, 0) & 1 \
                         and aux & TXE40_AUX_MODE != TXE40_AUX_BLOCK:
                     c.pending.append((c.steps + AIFS_US * c.mhz, COND_TX_NOW))
+            return
+        if n == SPR_TXE40_LENCALC:
+            if value & 1:
+                spr[SPR_TXE40_LENCALC] = value & ~1
+                spr[SPR_TXE40_LENCALC_OUT] = 0
             return
         if n == SPR_TXSTAT40_CMD:
             # bit 7: the next package, written from 16-bit slot (bits 2:0)
@@ -423,6 +441,35 @@ class TxEngine40(TxEngine):
         self.busy_until = c.clock + c.rxe._clock(1 + len(chunk) / COPY_BYTES_PER_US)
         self.log.append((c.clock, f"FIFO {self.cur} [{start}:+{count}] -> SHM {addr:#06x}, "
                                   f"command {value:#06x}"))
+
+    def aggregate(self, fifo):
+        """The frame handed over and the ones after it that the AQM takes, up
+        to AQMAggParams' count (1 outside an A-MPDU, 0x1279): each one
+        aggregatable and with the first one's epoch. That the epoch bounds
+        an aggregate is a hypothesis from wl 6.30, which changes it where the
+        peer, TID or rate change (wlc_ampdu_chgnsav_epoch()); the ucode reads
+        neither the epoch nor the MPDUs after the first. AQMAggLen is the
+        A-MPDU's length, a delimiter before each MPDU and each but the last
+        padded to 4 bytes; the reason in AQMAggStats stays 0."""
+        spr = self.chip.m.spr
+        q, k = self.fifos[fifo], self.fetched[fifo]
+        if k >= len(q):
+            spr[SPR_AQM_AGGSTATS] = spr[SPR_AQM_AGGLEN] = spr[SPR_AQM_AGGLEN + 1] = 0
+            return 0
+        limit = (spr.get(SPR_AQM_AGGPARAMS, 0) & 0x3F) + 1
+        epoch = q[k][2] & TOE_EPOCH
+        n = 1
+        while n < limit and k + n < len(q):
+            f = q[k + n]
+            if not f[6] & AC_MAC_AMPDU or f[2] & TOE_EPOCH != epoch:
+                break
+            n += 1
+        lens = [int.from_bytes(f[14:16], "little") for f in q[k:k + n]]
+        length = sum(4 + (x + 3 & ~3) for x in lens[:-1]) + 4 + lens[-1]
+        self.fetched[fifo] = k + n
+        spr[SPR_AQM_AGGSTATS] = n
+        spr[SPR_AQM_AGGLEN], spr[SPR_AQM_AGGLEN + 1] = length & 0xFFFF, length >> 16
+        return n
 
     def aqm_update(self, fifo, consume):
         """BMCCmd UpdateBA: mark the in-flight MPDUs the block ack bitmap in
