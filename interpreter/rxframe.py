@@ -89,6 +89,10 @@ def setup(fwdir, ucode, initvals=(), phy_type=0x2):
                       phy_type, fwmatrix.BEACON, tx=(20, 10, 30), mhz=80)
     chip = ls.chip
     chip.m.shm[0x10] = 2352
+    # B43_SHM_SH_MIMO_MAXSYM as b43-next writes it with HT on the N-PHY
+    # (b43_chip_init): with 0 the mimo ucodes drop every HT frame.
+    if phy == "mimo":
+        chip.m.shm[0x5D] = 0xFFFF
     # B43_SHM_SH_CHAN as b43-next writes it: the chanspec on the AC-PHY
     # (channel 36, 80 MHz: 0xE02A), the channel number before it (1)
     chip.m.shm[0x50] = 0xE02A if corerev >= 40 else 1
