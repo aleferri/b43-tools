@@ -327,6 +327,13 @@ FCS, is dropped, also in a sequence of frames (--then):
     ./rxframe.py openfwwf ucode5 --initvals openfwwf/b0g0initvals5.fw \
         --initvals openfwwf/b0g0bsinitvals5.fw
 
+`--ampdu N` sends an HT A-MPDU of N such MPDUs at MCS 7 instead (rxe.py's
+RxFrame `behind`: SPR 0x02B gives each member's length, the members after
+the first stream without a PLCP). 784.2's ucode30_mimo pushes each member
+with its RX header, as on the RT-AC56U:
+
+    ./rxframe.py fw/b43 ucode30_mimo --fc 0x0188 --len 1400 --ampdu 3
+
 `txe.py` is the chip's TX FIFOs before corerev 40: a frame given to
 `tx_frame()` is what the host's DMA queues (TX header, then the frame), the
 ucode moves its bytes with SPR_TXE0_SELECT and reports its TX status in

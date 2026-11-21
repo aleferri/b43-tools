@@ -70,7 +70,17 @@ condition was still raised from the frame before; the conditions a frame
 raised stay until their EOI after it. SPR 0x02B (spr.inc's SPR_RXE_0x56)
 reads 0x8000: the ucode takes bit 15 clear as another frame behind the one
 it finished (bits 0..11 its length, ucode30_mimo 0x07C4) and serves it
-without a PLCP. Frames do not queue here.
+without a PLCP. Single frames do not queue here.
+
+An A-MPDU is a frame with MPDUs `behind` it (opt-in). SPR 0x02B then holds
+the length of the MPDU the RXE parsed from the delimiter last: from a
+member's start its own (MPDU and FCS), which ucode30_mimo makes the mark
+(SPR 0x02A) of each member on the RT-AC56U, and from its end the next
+member's, or 0x8000 after the last. The next member streams once the
+ucode has pushed or dropped the one before, with no PLCP event and six
+zero bytes in place of the PLCP, as ucode30_mimo pushes members on the
+chip. On the chip it streams while the one before is still being pushed:
+the order here is a model.
 
 The ucode's writes of SPR_RXE_FIFOCTL1:
 
@@ -114,7 +124,7 @@ bad PLCPs, frames back to back, the BSSID match before corerev 40
 GO bit is in core.py).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 COND_RX_FCS_GOOD, COND_RX_BADPLCP, COND_RX_COMPLETE = 0x03, 0x05, 0x06
 COND_RX_PLCP, COND_RX_FIFOBUSY = 0x0E, 0x0B
@@ -165,6 +175,8 @@ class RxFrame:
     rcm: tuple = None           # corerev 40+: the RCM conditions, else from the AMT
     conds: tuple = ()           # more conditions the frame holds from its PLCP on
     subbands: int = 0xF         # corerev 40+: the 20 MHz sub-bands it came on
+    behind: tuple = ()          # A-MPDU: the MPDUs after this one (MPDU and FCS each)
+    member: bool = False        # an A-MPDU member after the first: no PLCP event
 
 
 @dataclass
@@ -226,6 +238,15 @@ class RxEngine:
     def _clock(self, us):
         return int(us * (self.chip.mhz or 80))
 
+    def start(self, start, f):
+        air = f.air_us if f.air_us is not None else \
+            f.plcp_us + 4 * ((len(f.data) - PLCP_LEN) * 8 + 22 + 23) // 24
+        self.frame, self.received, self.held, self.copied = f, 0, 0, 0
+        self.t_plcp = start + self._clock(f.plcp_us)
+        self.t_end = start + self._clock(air)
+        self.levels = self.levels & {COND_RX_FIFOBUSY}
+        self.complete, self.marked, self.push_due = False, 0, None
+
     def tick(self):
         """Bring the engine to the chip's clock."""
         c = self.chip
@@ -235,14 +256,7 @@ class RxEngine:
         if self.frame is None and not self.queue:
             return
         if self.frame is None and self.queue and self.queue[0][0] <= c.clock:
-            start, f = self.queue.pop(0)
-            air = f.air_us if f.air_us is not None else \
-                f.plcp_us + 4 * ((len(f.data) - PLCP_LEN) * 8 + 22 + 23) // 24
-            self.frame, self.received, self.held, self.copied = f, 0, 0, 0
-            self.t_plcp = start + self._clock(f.plcp_us)
-            self.t_end = start + self._clock(air)
-            self.levels = self.levels & {COND_RX_FIFOBUSY}
-            self.complete, self.marked, self.push_due = False, 0, None
+            self.start(*self.queue.pop(0))
         f = self.frame
         if f is None or c.clock < self.t_plcp:
             return
@@ -279,9 +293,14 @@ class RxEngine:
                 spr[SPR_RXE_TSF] = c.tsf() & 0xFFFF
             if c.hw.corerev >= 40:
                 spr[SPR_RXE_COUNT40] = (spr.get(SPR_RXE_COUNT40, 0) + 1) & 0xFFFF
-            c.events.add(COND_RX_PLCP)
-            c.napping = False       # a new frame wakes the PSM, raised before or not
-            self.log.append((c.clock, "plcp"))
+            if f.behind or f.member:
+                spr[SPR_RXE_NEXT] = (len(f.data) - PLCP_LEN) & 0x0FFF
+            if f.member:
+                self.log.append((c.clock, "member"))
+            else:
+                c.events.add(COND_RX_PLCP)
+                c.napping = False   # a new frame wakes the PSM, raised before or not
+                self.log.append((c.clock, "plcp"))
             self.received = PLCP_LEN
         want = self.arrived(c.clock)
         if want > self.received:
@@ -318,6 +337,8 @@ class RxEngine:
                 # frame's end (EOI of COND_RX_COMPLETE); when the hardware
                 # sets it is not known: here, at the end.
                 spr[SPR_RXE_STAT40] = spr.get(SPR_RXE_STAT40, 0) | STAT40_DONE
+            if f.behind or f.member:
+                spr[SPR_RXE_NEXT] = (len(f.behind[0]) & 0x0FFF) if f.behind else NEXT_NONE
             self.log.append((c.clock, "complete"))
             if self.push_due:
                 self.deliver(*self.push_due)
@@ -442,8 +463,15 @@ class RxEngine:
         self.fifo_busy_until = c.clock + self._clock(1 + size / FIFO_BYTES_PER_US)
 
     def end(self):
-        spr = self.chip.m.spr
+        spr, f = self.chip.m.spr, self.frame
         spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & \
             ~(STATUS_COPIED | STATUS_PLCP | STATUS_DATA)
         self.frame = None
         self.levels &= {COND_RX_FIFOBUSY}
+        if f.behind:
+            # The next A-MPDU member, at the rate of the one before.
+            mpdu = f.behind[0]
+            air = None if f.air_us is None else \
+                (f.air_us - f.plcp_us) * len(mpdu) / max(1, len(f.data) - PLCP_LEN)
+            self.start(self.chip.clock, replace(f, data=bytes(PLCP_LEN) + mpdu, behind=f.behind[1:],
+                                                member=True, plcp_us=0.0, air_us=air))

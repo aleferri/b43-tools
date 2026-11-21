@@ -70,6 +70,40 @@ def frame(fc, length, ra, fcs_ok):
     return plcp + mpdu
 
 
+def htsig_crc(bits):
+    """HT-SIG's CRC-8 (x^8 + x^2 + x + 1, ones in, complemented out)."""
+    c = [1] * 8
+    for b in bits:
+        fb = b ^ c[7]
+        c = [fb, c[0] ^ fb, c[1] ^ fb] + c[2:7]
+    return [1 - x for x in reversed(c)]
+
+
+def htsig(mcs, length, sig2=0x06):
+    """The six PLCP bytes of an HT frame as b43 sees them: HT-SIG1 (MCS,
+    20 MHz, length), HT-SIG2's first byte (0x06, or 0x0E with the
+    aggregation bit), its CRC over the 34 bits before it, the tail. Checked
+    against the copies of the RT-AC56U's BCM43217."""
+    b = [mcs & 0x7F, length & 0xFF, length >> 8 & 0xFF, sig2]
+    bits = [(x >> i) & 1 for x in b for i in range(8)] + [0, 0]
+    rest = [0, 0] + htsig_crc(bits) + [0] * 6
+    return bytes(b + [sum(v << i for i, v in enumerate(rest[:8])),
+                      sum(v << i for i, v in enumerate(rest[8:]))])
+
+
+def ampdu(fc, length, ra, n, mcs=7):
+    """An HT A-MPDU of n MPDUs like frame()'s, sequence numbers 1..n: the
+    first with its PLCP (the PPDU's length: the MPDUs, their 4-byte
+    delimiters, each padded to 4 bytes but the last), and the rest."""
+    mpdus = []
+    for k in range(n):
+        m = frame(fc, length, ra, True)[6:]
+        m = m[:22] + struct.pack("<H", (k + 1) << 4) + m[24:-4]
+        mpdus.append(m + struct.pack("<I", zlib.crc32(m)))
+    total = sum(4 + len(m) for m in mpdus) + sum(-len(m) % 4 for m in mpdus[:-1])
+    return htsig(mcs, total, 0x0E) + mpdus[0], tuple(mpdus[1:])
+
+
 def setup(fwdir, ucode, initvals=(), phy_type=0x2):
     """The chip in its idle AP loop with the host side set up; and its
     corerev."""
@@ -153,6 +187,8 @@ def main():
     ap.add_argument("--us", type=int, default=400, help="time to run after the frame")
     ap.add_argument("--initvals", action="append", default=[],
                     help="initvals and bsinitvals, where fwmatrix.py finds none")
+    ap.add_argument("--ampdu", type=int, default=0, metavar="N",
+                    help="an HT A-MPDU of N such MPDUs (MCS 7) instead of one frame")
     ap.add_argument("--phy-type", type=lambda x: int(x, 0), default=0x2,
                     help="PHY type with --initvals (default 0x2, G)")
     args = ap.parse_args()
@@ -173,9 +209,17 @@ def main():
     t0 = chip.clock
     counters = list(chip.m.shm[0x70:0xA0])
     old = corerev < 40      # RA and BSS match as OpenFWWF's conditions
-    f = rxe.RxFrame(frame(args.fc, args.len, args.ra, not args.bad_fcs),
-                    fcs_ok=not args.bad_fcs, ra_match=old and args.ra == ME,
-                    bss_match=old, conds=tuple(args.cond))
+    if args.ampdu:
+        first, behind = ampdu(args.fc, args.len, args.ra, args.ampdu)
+        # HT mixed format: 36 us of preamble to HT-SIG and the HT-LTF, then
+        # MCS 7 at 20 MHz (65 Mb/s) for the delimiter and the MPDU.
+        f = rxe.RxFrame(first, ra_match=old and args.ra == ME, bss_match=old,
+                        conds=tuple(args.cond), ofdm=False, ftype=2, behind=behind,
+                        plcp_us=36.0, air_us=36.0 + (len(first) - 6 + 4) * 8 / 65)
+    else:
+        f = rxe.RxFrame(frame(args.fc, args.len, args.ra, not args.bad_fcs),
+                        fcs_ok=not args.bad_fcs, ra_match=old and args.ra == ME,
+                        bss_match=old, conds=tuple(args.cond))
     chip.rxe.rx_frame(f)
     chip.wait(args.us, 300000)
     for ra in args.then:
@@ -184,7 +228,8 @@ def main():
                                       ra_match=old and ra == ME, bss_match=old))
         chip.wait(args.us, 300000)
     us = lambda clock: (clock - t0) / chip.mhz
-    print(f"{name}: frame of {len(f.data)} bytes, fc {args.fc:#06x}")
+    print(f"{name}: frame of {len(f.data)} bytes, fc {args.fc:#06x}"
+          + (f", A-MPDU of {args.ampdu}" if args.ampdu else ""))
     for clock, event in chip.rxe.log:
         print(f"  {us(clock):8.2f} us  {event}")
     for clock, sel in tx:
