@@ -189,6 +189,11 @@ class RxFrame:
     behind: tuple = ()          # A-MPDU: the MPDUs after this one (MPDU and FCS each)
     member: bool = False        # an A-MPDU member after the first: no PLCP event
 
+    def air(self):
+        """From the first bit to the last, in microseconds."""
+        return self.air_us if self.air_us is not None else \
+            self.plcp_us + 4 * ((len(self.data) - PLCP_LEN) * 8 + 22 + 23) // 24
+
 
 @dataclass
 class Pushed:
@@ -253,11 +258,9 @@ class RxEngine:
         return int(us * (self.chip.mhz or 80))
 
     def start(self, start, f):
-        air = f.air_us if f.air_us is not None else \
-            f.plcp_us + 4 * ((len(f.data) - PLCP_LEN) * 8 + 22 + 23) // 24
         self.frame, self.received, self.held, self.copied = f, 0, 0, 0
         self.t_plcp = start + self._clock(f.plcp_us)
-        self.t_end = start + self._clock(air)
+        self.t_end = start + self._clock(f.air())
         self.levels = self.levels & {COND_RX_FIFOBUSY}
         self.complete, self.marked, self.push_due = False, 0, None
         self.streaming, self.cut = False, None
