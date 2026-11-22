@@ -187,6 +187,11 @@ def main():
     ap.add_argument("--us", type=int, default=400, help="time to run after the frame")
     ap.add_argument("--initvals", action="append", default=[],
                     help="initvals and bsinitvals, where fwmatrix.py finds none")
+    ap.add_argument("--mbps", type=float, default=None,
+                    help="the frame's rate in Mb/s, for its air time (default 6)")
+    ap.add_argument("--rx-buffer", metavar="BYTES|chip", default=None,
+                    help="cut a frame the ucode has not let stream at BYTES ('chip': the "
+                    "RT-AC56U's size for the corerev, rxe.RX_BUFFER_CHIP)")
     ap.add_argument("--ampdu", type=int, default=0, metavar="N",
                     help="an HT A-MPDU of N such MPDUs (MCS 7) instead of one frame")
     ap.add_argument("--phy-type", type=lambda x: int(x, 0), default=0x2,
@@ -195,6 +200,9 @@ def main():
 
     name = args.ucode + ".fw"
     chip, corerev = setup(args.fwdir, args.ucode, args.initvals, args.phy_type)
+    if args.rx_buffer is not None:
+        chip.rxe.rx_buffer = rxe.RX_BUFFER_CHIP.get(corerev) if args.rx_buffer == "chip" \
+            else int(args.rx_buffer, 0)
 
     pcs, tx = set(), []
 
@@ -217,7 +225,9 @@ def main():
                         conds=tuple(args.cond), ofdm=False, ftype=2, behind=behind,
                         plcp_us=36.0, air_us=36.0 + (len(first) - 6 + 4) * 8 / 65)
     else:
-        f = rxe.RxFrame(frame(args.fc, args.len, args.ra, not args.bad_fcs),
+        data = frame(args.fc, args.len, args.ra, not args.bad_fcs)
+        air = None if args.mbps is None else 20.0 + (len(data) - 6) * 8 / args.mbps
+        f = rxe.RxFrame(data, air_us=air,
                         fcs_ok=not args.bad_fcs, ra_match=old and args.ra == ME,
                         bss_match=old, conds=tuple(args.cond))
     chip.rxe.rx_frame(f)

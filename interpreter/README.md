@@ -334,6 +334,14 @@ with its RX header, as on the RT-AC56U:
 
     ./rxframe.py fw/b43 ucode30_mimo --fc 0x0188 --len 1400 --ampdu 3
 
+`--rx-buffer BYTES` (or `chip`: 383 bytes on corerev 30, 1020 on corerev 42,
+what the RT-AC56U shows) cuts a frame the ucode has not let stream by then
+(SPR_RXE_FIFOCTL1 bit 7 while it arrives) at that size, with no
+COND_RX_FCS_GOOD; `--mbps R` sets the frame's rate for its air time. 784.2's
+ucode42 lets a 1000-byte frame at MCS 7 stream at the mark and pushes it whole:
+
+    ./rxframe.py fw/b43 ucode42 --fc 0x0088 --len 1000 --mbps 72 --rx-buffer chip
+
 `txe.py` is the chip's TX FIFOs before corerev 40: a frame given to
 `tx_frame()` is what the host's DMA queues (TX header, then the frame), the
 ucode moves its bytes with SPR_TXE0_SELECT and reports its TX status in
