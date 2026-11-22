@@ -60,7 +60,10 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               (ucode30_mimo 0x079D..0x07A8, 0x07CD; ucode42 0x080A..0x080E,
               0x0832). A hypothesis.
               SPR_RXE_STATUS bit 14 once all of the copy is there and the
-              frame has ended.
+              frame's last byte is in the RX buffer: on the RT-AC56U
+              (corerev 42) FRAMELEN reads the whole frame wherever bit 14 is
+              first seen set. Single frames wait for it before the push,
+              where ucode42 puts FRAMELEN in the RX header (0x0968, 0x0D08).
   + air_us    COND_RX_COMPLETE, raised while the frame is in the RX buffer and
               latched until its EOI besides. COND_RX_FCS_GOOD, held until the
               EOI, if the FCS is good.
@@ -109,8 +112,20 @@ From corerev 40 the ucode needs more:
     sub-bands the frame came on, all four here (`subbands`). A hypothesis:
     ucode42 keeps a probe request only if they include the chanspec's
     control sub-band (SHM 0x50, 0x0A84).
-  - SPR 0x263 bit 12 from the frame's end to the next PLCP: ucode42 waits
-    for it before it takes COND_RX_COMPLETE (0x095F), and after the push.
+  - SPR 0x240, cleared at the PLCP, once the MAC header of a data or
+    management frame is in the RX buffer: bit 0, bits 1..6 the header's
+    length in bytes, bit 8 if it is 2 bytes short of a multiple of 4.
+    ucode42 waits for COND_RX_COMPLETE or bit 0 (0x083A), takes the crypto
+    offset from bits 1..6 plus the PLCP (0x083D) and the RX padding from
+    bit 7 XOR bit 8 (0x0844..0x0847). On the RT-AC56U what follows bit 0
+    (FIFOCTL1 bits 1 and 5, SPR_BRC 0x0142, WEP_CTL) is there ~38 bytes
+    into a frame, QoS data is pushed padded and never counted in SHM 0x98,
+    where ucode42 counts unicast frames with bit 7 (0x09FB): bit 7 stays
+    clear here. Bits 1..6 and 8 are a hypothesis; for control frames
+    nothing is set.
+  - SPR 0x263 bit 12, set throughout on the RT-AC56U, during frames and
+    between them: ucode42 waits for it before it takes COND_RX_COMPLETE
+    (0x095F), and after the push.
   - SPR 0x290 bit 0: without it a push reaches no RX DMA ring (RT-AC56U);
     ucode42 sets it (0x0D03).
   - SPR 0x293 counts the PLCPs: ucode42 puts its bits 0..5 in bits 10..15
@@ -151,13 +166,15 @@ SPR_RXE_MARK = 0x02A            # spr.inc's SPR_RXE_0x54
 SPR_RXE_NEXT = 0x02B            # spr.inc's SPR_RXE_0x56
 NEXT_NONE = 0x8000
 SPR_RXE_STAT40 = 0x263
+SPR_RXE_HDR40 = 0x240
+HDR40_IN, HDR40_PAD = 0x0001, 0x0100
 SPR_RXE_COUNT40 = 0x293         # bits 10..15 of the RX header's word 9 on corerev 42
 SPR_RXE_TSF = 0x11F             # spr.inc's SPR_TSF_0x3e: the RX header's mac_time
 SPR_RXE_LOOKUP40, SPR_RXE_LOOKUP40_DONE, SPR_RXE_LOOKUP40_IDX = 0x260, 0x271, 0x274
 AMT_ROWS, AMT_F_VALID, AMT_F_SELF, AMT_F_BSSID = 64, 0x8000, 0x0008, 0x0002
 COND_RX_RAMATCH40, COND_RX_TABSS40, COND_RX_A3BSS40 = 0x61, 0x62, 0x63
 PHY_RXSUBBANDS40 = 0x143        # AC-PHY register, bits 12..15
-STAT40_DONE = 0x1000
+STAT40_B12 = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
@@ -204,11 +221,28 @@ class Pushed:
     frame: RxFrame = field(repr=False, default=None)
 
 
+def mac_header_len(mpdu):
+    """The length of the MAC header of a data or management frame (802.11
+    with HT control); None for others."""
+    if len(mpdu) < 2:
+        return None
+    fc = mpdu[0] | mpdu[1] << 8
+    ftype = fc >> 2 & 3
+    if ftype not in (0, 2):
+        return None
+    qos = ftype == 2 and bool(fc & 0x0080)
+    a4 = ftype == 2 and fc >> 8 & 3 == 3
+    htc = bool(fc & 0x8000) and (qos or ftype == 0)
+    return 24 + 6 * a4 + 2 * qos + 4 * htc
+
+
 class RxEngine:
     def __init__(self, chip):
         self.chip = chip
         # Nothing behind the frame in the buffer: frames come one at a time.
         chip.m.spr[SPR_RXE_NEXT] = NEXT_NONE
+        if chip.hw.corerev >= 40:
+            chip.m.spr[SPR_RXE_STAT40] = STAT40_B12
         self.frame = None
         self.queue = []             # (clock, RxFrame) still to start
         self.t_plcp = self.t_end = None
@@ -227,6 +261,7 @@ class RxEngine:
         self.rx_buffer = None       # bytes a frame not streaming is cut at; None: no limit
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
+        self.hdr40 = None           # corerev 40+: the MAC header's length, until SPR 0x240 has it
 
     # ---- the air side ----
     def rx_frame(self, frame, at=None):
@@ -264,6 +299,8 @@ class RxEngine:
         self.levels = self.levels & {COND_RX_FIFOBUSY}
         self.complete, self.marked, self.push_due = False, 0, None
         self.streaming, self.cut = False, None
+        if self.chip.hw.corerev >= 40:
+            self.hdr40 = mac_header_len(f.data[PLCP_LEN:])
 
     def tick(self):
         """Bring the engine to the chip's clock."""
@@ -288,8 +325,8 @@ class RxEngine:
                 spr[n] = v & 0xFFFF
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & ~STATUS_COPIED | \
                 STATUS_PLCP | STATUS_DATA
-            if SPR_RXE_STAT40 in spr:
-                spr[SPR_RXE_STAT40] &= ~STAT40_DONE
+            if c.hw.corerev >= 40:
+                spr[SPR_RXE_HDR40] = 0
             if f.ra_match:
                 self.levels.add(COND_RX_RAMATCH)
             if f.bss_match:
@@ -336,6 +373,10 @@ class RxEngine:
         if framelen != spr.get(SPR_RXE_FRAMELEN):
             spr[SPR_RXE_FRAMELEN] = framelen
         self.copy(held)
+        if self.hdr40 is not None and held >= PLCP_LEN + self.hdr40:
+            length, self.hdr40 = self.hdr40, None
+            spr[SPR_RXE_HDR40] = HDR40_IN | length << 1 | (HDR40_PAD if length % 4 == 2 else 0)
+            self.log.append((c.clock, f"MAC header in, {length} bytes"))
         if held == n and spr.get(SPR_RXE_STATUS, 0) & STATUS_DATA:
             spr[SPR_RXE_STATUS] &= ~STATUS_DATA
         mark = spr.get(SPR_RXE_MARK, 0)
@@ -346,7 +387,7 @@ class RxEngine:
                 c.napping = False
                 self.log.append((c.clock, f"{mark} bytes"))
         if self.copy_done() and not spr.get(SPR_RXE_STATUS, 0) & STATUS_COPIED \
-                and self.complete:
+                and self.complete and held == n:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
         if c.clock >= self.t_end and not self.complete:
             self.complete = True
@@ -355,13 +396,8 @@ class RxEngine:
             c.napping = False
             if f.fcs_ok and self.cut is None:
                 c.events.add(COND_RX_FCS_GOOD)
-            if self.copy_done():
+            if self.copy_done() and held == n:
                 spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
-            if c.hw.corerev >= 40:
-                # The corerev 42 ucode waits for it before it takes the
-                # frame's end (EOI of COND_RX_COMPLETE); when the hardware
-                # sets it is not known: here, at the end.
-                spr[SPR_RXE_STAT40] = spr.get(SPR_RXE_STAT40, 0) | STAT40_DONE
             if f.behind or f.member:
                 spr[SPR_RXE_NEXT] = (len(f.behind[0]) & 0x0FFF) if f.behind else NEXT_NONE
             self.log.append((c.clock, "complete"))
