@@ -117,6 +117,15 @@ From corerev 40 the ucode needs more:
     of RX header word 9 (0x0A3F), bits that grow from frame to frame on the
     routers.
 
+The RX buffer's size (opt-in, `rx_buffer`): a frame stays in the RX buffer
+until the ucode lets it stream, with a write of SPR_RXE_FIFOCTL1 that has bit
+7 set while the frame arrives (0x20C0, 0x2082). One that outgrows the buffer
+before that is cut there: SPR_RXE_FRAMELEN stops at the size, its other bytes
+are lost, COND_RX_FCS_GOOD does not come and a push delivers what was kept.
+On the RT-AC56U the BCM43217 (corerev 30) cut at 383 bytes without the
+release, the BCM4352 (corerev 42) at 1020 (RX_BUFFER_CHIP); which bit is the
+release is a hypothesis.
+
 Not modelled: which FIFOCTL1 bits clear themselves, the timing, overflow,
 bad PLCPs, frames back to back, the BSSID match before corerev 40
 (COND_RX_BSSMATCH is held for every frame), conditions 0x64, 0x67 and
@@ -151,6 +160,8 @@ PHY_RXSUBBANDS40 = 0x143        # AC-PHY register, bits 12..15
 STAT40_DONE = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
+FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
+RX_BUFFER_CHIP = {30: 383, 42: 1020}   # corerev: bytes a held frame is cut at on the RT-AC56U
 SPR_RXE_DMA40, DMA40_ON = 0x290, 0x0001
 FRAMELEN_SHORT = {30: 2}        # corerev: bytes SPR_RXE_FRAMELEN never counts
 STATUS_COPIED, STATUS_PLCP, STATUS_DATA = 0x4000, 0x1000, 0x2000
@@ -208,6 +219,9 @@ class RxEngine:
         self.fifo = []              # Pushed
         self.dropped = []           # RxFrame
         self.log = []               # (clock, event)
+        self.rx_buffer = None       # bytes a frame not streaming is cut at; None: no limit
+        self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
+        self.cut = None             # the bytes a cut frame kept
 
     # ---- the air side ----
     def rx_frame(self, frame, at=None):
@@ -246,6 +260,7 @@ class RxEngine:
         self.t_end = start + self._clock(air)
         self.levels = self.levels & {COND_RX_FIFOBUSY}
         self.complete, self.marked, self.push_due = False, 0, None
+        self.streaming, self.cut = False, None
 
     def tick(self):
         """Bring the engine to the chip's clock."""
@@ -306,8 +321,15 @@ class RxEngine:
         if want > self.received:
             self.received = want
         n = len(f.data)
-        self.held = held = self.arrived(c.clock - self._clock(COPY_LAG_US))
-        framelen = min(held, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+        held = self.arrived(c.clock - self._clock(COPY_LAG_US))
+        if self.rx_buffer is not None and not self.streaming and self.received > self.rx_buffer \
+                and self.cut is None:
+            self.cut = self.rx_buffer
+            self.log.append((c.clock, f"cut at {self.rx_buffer} bytes: the RX buffer full"))
+        if self.cut is not None:
+            held = self.cut if c.clock < self.t_end else n
+        self.held = held
+        framelen = min(held if self.cut is None else self.cut, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
         if framelen != spr.get(SPR_RXE_FRAMELEN):
             spr[SPR_RXE_FRAMELEN] = framelen
         self.copy(held)
@@ -328,7 +350,7 @@ class RxEngine:
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
             c.napping = False
-            if f.fcs_ok:
+            if f.fcs_ok and self.cut is None:
                 c.events.add(COND_RX_FCS_GOOD)
             if self.copy_done():
                 spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
@@ -430,6 +452,10 @@ class RxEngine:
                 self.lookup_due = False
                 self.lookup()
         ctl = spr.get(SPR_RXE_FIFOCTL1, 0)
+        if ctl & FIFOCTL1_STREAM and self.frame is not None and not self.streaming \
+                and self.cut is None:
+            self.streaming = True
+            self.log.append((c.clock, "streams"))
         if not ctl & (FIFOCTL1_PUSH | FIFOCTL1_DROP):
             return
         f = self.frame
@@ -456,7 +482,8 @@ class RxEngine:
         if c.hw.corerev >= 40 and not c.m.spr.get(SPR_RXE_DMA40, 0) & DMA40_ON:
             self.log.append((c.clock, "push, no RX DMA: SPR 0x290 bit 0 clear"))
         else:
-            self.fifo.append(Pushed(hdr, pad, self.frame.data, c.clock, self.frame))
+            data = self.frame.data if self.cut is None else self.frame.data[:self.cut]
+            self.fifo.append(Pushed(hdr, pad, data, c.clock, self.frame))
             self.log.append((c.clock, "push"))
         self.end()
         self.levels.add(COND_RX_FIFOBUSY)
