@@ -1,5 +1,6 @@
 #!/bin/sh
-# matrix.sh DEBUGFS LO HI [OUT]: on the device, the full-address matrix. Every MMIO address 0x400-0x7FE except the
+# matrix.sh DEBUGFS LO HI [OUT]: on the device, the full-address matrix. Every MMIO address 0x400-0x7FE and
+# 0x800-0x9FE (SPR 0x000-0x2FF: 0x263, 0x265, 0x271 ... live above 0x7FE) except the
 # data ports (0x422, 0x432, 0x540, 0x542, 0x560, 0x562) and the TX status FIFO (0x518-0x51E) is sampled together
 # with FRAMELEN (0x418) by pdtrace in its history mode: 3000 rows, 1500 before the moment FRAMELEN reaches 6 (the
 # mark) and 1500 after it. A capture is kept when FRAMELEN peaks in [LO, HI] after the mark (one frame of the
@@ -7,7 +8,7 @@
 #   index tsf-low phydebug value framelen
 # DEBUGFS is the phy's directory, e.g. /sys/kernel/debug/b43_next/phy0 (needs b43-next-capture.patch).
 D=$1; LO=$2; HI=$3
-for a in $(seq $((0x400)) 2 $((0x7FE))); do
+for a in $(seq $((0x400)) 2 $((0x7FE))) $(seq $((0x800)) 2 $((0x9FE))); do
 	h=$(printf 0x%03X $a)
 	case $h in 0x422|0x432|0x518|0x51A|0x51C|0x51E|0x540|0x542|0x560|0x562) continue;; esac
 	got=0

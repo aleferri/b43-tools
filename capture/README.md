@@ -31,9 +31,10 @@ registers do around each frame, and compare.
 
 1. **Traffic.** Load the ucode and associate a station. Send frames of one known size, such as pings every 30 ms.
    Their FRAMELEN peak (MPDU plus the 6-byte PLCP) singles them out from everyone else's traffic.
-2. **The matrix.** `matrix.sh DEBUGFS LO HI > matrix.txt` covers every address in 0x400-0x7FE, except the data ports
+2. **The matrix.** `matrix.sh DEBUGFS LO HI > matrix.txt` covers every address in 0x400-0x7FE and 0x800-0x9FE
+   (SPR 0x000-0x2FF), except the data ports
    and the TX status FIFO, whose reads would consume data. Each address gets 1500 samples before the mark and 1500
-   after, on one frame with its FRAMELEN peak in [LO, HI]. It takes about 100 minutes per ucode.
+   after, on one frame with its FRAMELEN peak in [LO, HI]. It takes about 3 hours per ucode.
 3. **The watch list.** `watchlist.py matrix.txt > groups.txt` lists the addresses that move around the frame, leaves
    out free-running timers, and groups them six per line with FRAMELEN first.
 4. **The timelines.** `watch.sh DEBUGFS groups.txt 300000 > watch.txt` gives every change of every listed address
