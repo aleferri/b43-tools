@@ -29,6 +29,7 @@ engine raised, the frames pushed to the FIFO, the SHM counters that moved
 """
 
 import argparse
+import math
 import os
 import struct
 import zlib
@@ -231,12 +232,12 @@ def main():
                         fcs_ok=not args.bad_fcs, ra_match=old and args.ra == ME,
                         bss_match=old, conds=tuple(args.cond))
     chip.rxe.rx_frame(f)
-    chip.wait(args.us, 300000)
+    chip.wait(math.ceil(f.air()) + args.us, 300000)
     for ra in args.then:
         ra = bytes.fromhex(ra)
-        chip.rxe.rx_frame(rxe.RxFrame(frame(args.fc, args.len, ra, True),
-                                      ra_match=old and ra == ME, bss_match=old))
-        chip.wait(args.us, 300000)
+        g = rxe.RxFrame(frame(args.fc, args.len, ra, True), ra_match=old and ra == ME, bss_match=old)
+        chip.rxe.rx_frame(g)
+        chip.wait(math.ceil(g.air()) + args.us, 300000)
     us = lambda clock: (clock - t0) / chip.mhz
     print(f"{name}: frame of {len(f.data)} bytes, fc {args.fc:#06x}"
           + (f", A-MPDU of {args.ampdu}" if args.ampdu else ""))
