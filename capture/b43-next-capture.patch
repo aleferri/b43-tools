@@ -1,0 +1,295 @@
+--- a/b43-next/debugfs.h	2026-11-22 22:38:34.128505645 +0200
++++ b/b43-next/debugfs.h	2026-11-22 22:38:34.200506039 +0200
+@@ -45,6 +45,8 @@
+ 	struct b43_dfs_file file_shm32read;
+ 	struct b43_dfs_file file_shm32write;
+ 	struct b43_dfs_file file_mmio16read;
++	struct b43_dfs_file file_pdtrace;
++	struct b43_dfs_file file_regwatch;
+ 	struct b43_dfs_file file_mmio16write;
+ 	struct b43_dfs_file file_mmio32read;
+ 	struct b43_dfs_file file_mmio32write;
+@@ -57,6 +59,11 @@
+ 
+ 	/* The cached address for the next mmio16read file read */
+ 	u16 mmio16read_next;
++	u32 *pd_buf;		/* pdtrace samples */
++	unsigned int pd_n;
++	int pd_trig;
++	u32 *rw_ev;		/* regwatch events (tsf, addr << 16 | value) */
++	unsigned int rw_n, rw_cur, rw_passes, rw_gaps;
+ 	/* The cached address for the next mmio32read file read */
+ 	u16 mmio32read_next;
+ 
+--- a/b43-next/debugfs.c	2026-11-22 22:38:34.112505558 +0200
++++ b/b43-next/debugfs.c	2026-11-22 22:38:34.200506039 +0200
+@@ -13,6 +13,7 @@
+ #include <linux/fs.h>
+ #include <linux/debugfs.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/netdevice.h>
+ #include <linux/pci.h>
+ #include <linux/mutex.h>
+@@ -486,6 +487,234 @@
+ 	return err ? err : count;
+ }
+ 
++/* pdtrace (capture tool). Write "N MASK": wait up to 300 ms for (phydebug & MASK),
++ * then N samples of phydebug (0x158), TX_COUNT (0x56A), TSF low (0x632),
++ * back to back with interrupts off. Read: the changes only. */
++#define PD_MAX 6000
++static ssize_t pdtrace__read_file(struct b43_wldev *dev, char *buf, size_t bufsize)
++{
++	ssize_t count = 0;
++	unsigned int i;
++	u32 *b = dev->dfsentry->pd_buf;
++	if (!b)
++		return -ENODATA;
++	fappend("trig %d n %u\n", dev->dfsentry->pd_trig, dev->dfsentry->pd_n);
++	for (i = 0; i < dev->dfsentry->pd_n; i++) {
++		if (i && b[4 * i] == b[4 * (i - 1)] && b[4 * i + 1] == b[4 * (i - 1) + 1] && b[4 * i + 3] == b[4 * (i - 1) + 3])
++			continue;
++		if (count > bufsize - 64)
++			break;
++		fappend("%5u %04x %08x %04x %04x\n", i, b[4 * i + 2] & 0xFFFF, b[4 * i], b[4 * i + 1], b[4 * i + 3]);
++	}
++	return count;
++}
++static int pdtrace__write_file(struct b43_wldev *dev, const char *buf, size_t count)
++{
++	unsigned int n, mask, i, ra = 0x56A, rb = 0x500;
++	unsigned long flags, end;
++	u32 *b;
++	if (sscanf(buf, "%u 0x%X 0x%X 0x%X", &n, &mask, &ra, &rb) < 2 || n == 0 || n > PD_MAX ||
++	    ra > 0xFFE || rb > 0xFFE)
++		return -EINVAL;
++	/* mask 0: trigger on SELECT (0x568) going to the template select 0x0826 */
++	if (!dev->dfsentry->pd_buf)
++		dev->dfsentry->pd_buf = kcalloc(4 * PD_MAX, sizeof(u32), GFP_KERNEL);
++	b = dev->dfsentry->pd_buf;
++	if (!b)
++		return -ENOMEM;
++	dev->dfsentry->pd_trig = 0;
++	end = jiffies + msecs_to_jiffies((mask & 0x40000000) ? 2000 : 300);
++	if (!mask) {
++		while (time_before(jiffies, end) && b43_read16(dev, 0x568) == 0x0826)
++			cpu_relax();
++	}
++	/* MASK with bits 30 and 29: the bit-30 trigger with history: samples go round a ring of N with interrupts off,
++	 * in bursts of 20000 samples (interrupts on between bursts, up to 2 s); at the trigger N/2 more are taken, so the
++	 * N rows read back run from N/2 samples before the trigger to N/2 after it (the trigger at row N/2) */
++	if ((mask & 0x60000000) == 0x60000000) {
++		u16 want = mask & 0xFFFF;
++		unsigned int k = 0, post = 0, burst, armed = 0, trig_at = 0, filled = 0;
++		u32 *r = b + 4 * PD_MAX / 2;	/* the ring in the buffer's second half; rows unrolled into the first */
++		if (n > PD_MAX / 2)
++			n = PD_MAX / 2;
++		while (time_before(jiffies, end) && !dev->dfsentry->pd_trig) {
++			local_irq_save(flags);
++			for (burst = 0; burst < 20000; burst++) {
++				u16 vb = b43_read16(dev, rb);
++				r[4 * k] = b43_read32(dev, 0x158);
++				r[4 * k + 1] = b43_read16(dev, ra);
++				r[4 * k + 2] = b43_read16(dev, 0x632);
++				r[4 * k + 3] = vb;
++				k = (k + 1) % n;
++				if (filled < n)
++					filled++;
++				if (vb != want)
++					armed = 1;
++				else if (armed && filled >= n / 2) {
++					dev->dfsentry->pd_trig = 1;
++					trig_at = k;
++					break;
++				}
++			}
++			if (dev->dfsentry->pd_trig) {
++				for (post = 0; post < n - n / 2 - 1; post++) {
++					r[4 * k] = b43_read32(dev, 0x158);
++					r[4 * k + 1] = b43_read16(dev, ra);
++					r[4 * k + 2] = b43_read16(dev, 0x632);
++					r[4 * k + 3] = b43_read16(dev, rb);
++					k = (k + 1) % n;
++				}
++			}
++			local_irq_restore(flags);
++			cpu_relax();
++		}
++		(void)trig_at;
++		/* oldest first: the ring's next slot is the oldest once it is full */
++		for (i = 0; i < n; i++) {
++			unsigned int j = (k + i) % n;
++			b[4 * i] = r[4 * j];
++			b[4 * i + 1] = r[4 * j + 1];
++			b[4 * i + 2] = r[4 * j + 2];
++			b[4 * i + 3] = r[4 * j + 3];
++		}
++		dev->dfsentry->pd_n = n;
++		return 0;
++	}
++	/* MASK with bit 30: wait for register RB to differ from MASK's low 16 bits, then for it to equal them */
++	if (mask & 0x40000000) {
++		u16 want = mask & 0xFFFF;
++		while (time_before(jiffies, end) && b43_read16(dev, rb) == want)
++			cpu_relax();
++		while (time_before(jiffies, end)) {
++			if (b43_read16(dev, rb) == want) {
++				dev->dfsentry->pd_trig = 1;
++				break;
++			}
++			cpu_relax();
++		}
++		goto sample;
++	}
++	/* MASK with bit 31: edge mode, wait for (phydebug & MASK) clear first (a PPDU start) */
++	if (mask & 0x80000000) {
++		mask &= ~0x80000000;
++		while (time_before(jiffies, end) && (b43_read32(dev, 0x158) & mask))
++			cpu_relax();
++	}
++	while (time_before(jiffies, end)) {
++		if (mask ? (b43_read32(dev, 0x158) & mask) : (b43_read16(dev, 0x568) == 0x0826)) {
++			dev->dfsentry->pd_trig = 1;
++			break;
++		}
++		cpu_relax();
++	}
++sample:
++	local_irq_save(flags);
++	for (i = 0; i < n; i++) {
++		b[4 * i] = b43_read32(dev, 0x158);
++		b[4 * i + 1] = b43_read16(dev, ra);
++		b[4 * i + 2] = b43_read16(dev, 0x632);
++		b[4 * i + 3] = b43_read16(dev, rb);
++	}
++	local_irq_restore(flags);
++	dev->dfsentry->pd_n = n;
++	return 0;
++}
++
++/* regwatch (capture tool). Write "US all" or "US ADDR ADDR ...": the MMIO addresses (16-bit; "all" = 0x400-0x7FE but the
++ * data ports and the TX status FIFO) are read in passes for US microseconds, interrupts off in bursts of up to
++ * 3 ms; every change is kept as (TSF, address, value), the first pass included, and each burst boundary as a gap
++ * row (address 0xFFFF). Read: the rows from a cursor on, a header first; a write rewinds. */
++#define RW_MAX_EV	(256 * 1024)
++#define RW_MAX_ADDR	512
++static ssize_t regwatch__read_file(struct b43_wldev *dev, char *buf, size_t bufsize)
++{
++	ssize_t count = 0;
++	struct b43_dfsentry *e = dev->dfsentry;
++	if (!e->rw_ev)
++		return -ENODATA;
++	if (e->rw_cur == 0)
++		fappend("regwatch events %u passes %u gaps %u\n", e->rw_n, e->rw_passes, e->rw_gaps);
++	while (e->rw_cur < e->rw_n && count < bufsize - 64) {
++		u32 t = e->rw_ev[2 * e->rw_cur], av = e->rw_ev[2 * e->rw_cur + 1];
++		fappend("%u %03x %04x\n", t, av >> 16, av & 0xFFFF);
++		e->rw_cur++;
++	}
++	return count;
++}
++static int regwatch__write_file(struct b43_wldev *dev, const char *buf, size_t count)
++{
++	struct b43_dfsentry *e = dev->dfsentry;
++	static u16 addrs[RW_MAX_ADDR], last[RW_MAX_ADDR];
++	unsigned int us, na = 0, a, i;
++	unsigned long flags;
++	const char *p = buf;
++	int used;
++	u32 t0, now;
++	if (sscanf(p, "%u%n", &us, &used) < 1 || us == 0 || us > 10000000)
++		return -EINVAL;
++	p += used;
++	while (*p == ' ')
++		p++;
++	if (!strncmp(p, "all", 3)) {
++		for (a = 0x400; a <= 0x7FE && na < RW_MAX_ADDR; a += 2) {
++			if (a == 0x422 || a == 0x432 || (a >= 0x518 && a <= 0x51E) || a == 0x540 || a == 0x542 ||
++			    a == 0x560 || a == 0x562)
++				continue;
++			addrs[na++] = a;
++		}
++	} else {
++		while (na < RW_MAX_ADDR && sscanf(p, " 0x%X%n", &a, &used) == 1) {
++			if (a > 0xFFE)
++				return -EINVAL;
++			addrs[na++] = a;
++			p += used;
++		}
++	}
++	if (!na)
++		return -EINVAL;
++	if (!e->rw_ev)
++		e->rw_ev = vmalloc(2 * RW_MAX_EV * sizeof(u32));
++	if (!e->rw_ev)
++		return -ENOMEM;
++	e->rw_n = e->rw_cur = e->rw_passes = e->rw_gaps = 0;
++	t0 = b43_read16(dev, 0x632) | (u32)b43_read16(dev, 0x634) << 16;
++	for (i = 0; i < na; i++) {
++		last[i] = b43_read16(dev, addrs[i]);
++		if (e->rw_n < RW_MAX_EV) {
++			e->rw_ev[2 * e->rw_n] = 0;
++			e->rw_ev[2 * e->rw_n + 1] = (u32)addrs[i] << 16 | last[i];
++			e->rw_n++;
++		}
++	}
++	do {
++		u32 burst0;
++		local_irq_save(flags);
++		burst0 = b43_read16(dev, 0x632) | (u32)b43_read16(dev, 0x634) << 16;
++		do {
++			now = b43_read16(dev, 0x632) | (u32)b43_read16(dev, 0x634) << 16;
++			for (i = 0; i < na; i++) {
++				u16 v = b43_read16(dev, addrs[i]);
++				if (v != last[i] && e->rw_n < RW_MAX_EV) {
++					e->rw_ev[2 * e->rw_n] = now - t0;
++					e->rw_ev[2 * e->rw_n + 1] = (u32)addrs[i] << 16 | v;
++					e->rw_n++;
++				}
++				last[i] = v;
++			}
++			e->rw_passes++;
++		} while (now - burst0 < 3000 && now - t0 < us && e->rw_n < RW_MAX_EV);
++		local_irq_restore(flags);
++		if (now - t0 < us && e->rw_n < RW_MAX_EV) {
++			e->rw_ev[2 * e->rw_n] = now - t0;
++			e->rw_ev[2 * e->rw_n + 1] = 0xFFFF0000;
++			e->rw_n++;
++			e->rw_gaps++;
++			cond_resched();
++		}
++	} while (now - t0 < us && e->rw_n < RW_MAX_EV);
++	return 0;
++}
++
+ #undef fappend
+ 
+ static ssize_t b43_debugfs_read(struct file *file, char __user *userbuf,
+@@ -618,6 +847,8 @@
+ B43_DEBUGFS_FOPS(shm32read, shm32read__read_file, shm32read__write_file);
+ B43_DEBUGFS_FOPS(shm32write, NULL, shm32write__write_file);
+ B43_DEBUGFS_FOPS(mmio16read, mmio16read__read_file, mmio16read__write_file);
++B43_DEBUGFS_FOPS(pdtrace, pdtrace__read_file, pdtrace__write_file);
++B43_DEBUGFS_FOPS(regwatch, regwatch__read_file, regwatch__write_file);
+ B43_DEBUGFS_FOPS(mmio16write, NULL, mmio16write__write_file);
+ B43_DEBUGFS_FOPS(mmio32read, mmio32read__read_file, mmio32read__write_file);
+ B43_DEBUGFS_FOPS(mmio32write, NULL, mmio32write__write_file);
+@@ -863,6 +1094,8 @@
+ 	ADD_FILE(shm32read, 0600);
+ 	ADD_FILE(shm32write, 0200);
+ 	ADD_FILE(mmio16read, 0600);
++	ADD_FILE(pdtrace, 0600);
++	ADD_FILE(regwatch, 0600);
+ 	ADD_FILE(mmio16write, 0200);
+ 	ADD_FILE(mmio32read, 0600);
+ 	ADD_FILE(mmio32write, 0200);
+@@ -889,6 +1122,8 @@
+ 	debugfs_remove(e->subdir);
+ 	b43_cal_remove(dev, e);
+ 	kfree(e->txstatlog.log);
++	kfree(e->pd_buf);
++	vfree(e->rw_ev);
+ 	kfree(e);
+ }
+ 
