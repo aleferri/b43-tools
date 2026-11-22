@@ -101,6 +101,23 @@ The ucode's writes of SPR_RXE_FIFOCTL1:
   bit 4       drop: the RX buffer is flushed and the frame ends (written
               after a frame not taken, and after a push).
 
+A push needs bit 0 set by the write, as it reads back latched from corerev
+40 on. What a ucode write leaves in SPR_RXE_FIFOCTL1, before corerev 40 the
+write without bits 0 and 4; from corerev 40, as the RT-AC56U (corerev 42)
+reads it back, at idle 1 us after a write of each bit and while frames
+arrive:
+
+  bit 11            always set
+  bits 4, 6, 7, 13  never read back
+  bits 2, 10        once written, until the end on the air of the frame
+                    being received, dropped or not, whatever is written
+                    meanwhile (0x0904 after 0x0110, 0x0804 and 0x0C22 to its
+                    last byte; clear at once at idle); bit 2 is the RX
+                    suspend every ucode sets before a MAC suspend and waits on
+  the others        as written: bit 0 after a push until a write clears it
+                    (0x0801 up to the next PLCP); bits 3, 14 and 15 are not
+                    measured
+
 From corerev 40 the ucode needs more:
 
   - SPR 0x241: the frame control, from which ucode42 takes type and
@@ -146,11 +163,15 @@ On the RT-AC56U the BCM43217 (corerev 30) cut at 383 bytes without the
 release, the BCM4352 (corerev 42) at 1020 (RX_BUFFER_CHIP); which bit is the
 release is a hypothesis.
 
-Not modelled: which FIFOCTL1 bits clear themselves, the timing, overflow,
-bad PLCPs, frames back to back, the BSSID match before corerev 40
-(COND_RX_BSSMATCH is held for every frame), conditions 0x64, 0x67 and
-0x68, SPR 0x240/0x244/0x274 beyond the above, and the crypto engine (its
-GO bit is in core.py).
+A frame starts no earlier than the end on the air of the one before: one
+given to rx_frame() for an earlier time arrives then.
+
+Not modelled: FRAMELEN after a drop, which stops here where the chip's
+counts to the frame's end; which FIFOCTL1 bits clear themselves before
+corerev 40; the timing, overflow, bad PLCPs, frames back to back, the
+BSSID match before corerev 40 (COND_RX_BSSMATCH is held for every frame),
+conditions 0x64, 0x67 and 0x68, SPR 0x240/0x244/0x274 beyond the above,
+and the crypto engine (its GO bit is in core.py).
 """
 
 from dataclasses import dataclass, field, replace
@@ -183,6 +204,7 @@ STAT40_B12 = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
+FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
 RX_BUFFER_CHIP = {30: 383, 42: 1020}   # corerev: bytes a held frame is cut at on the RT-AC56U
 SPR_RXE_DMA40, DMA40_ON = 0x290, 0x0001
 FRAMELEN_SHORT = {30: 2}        # corerev: bytes SPR_RXE_FRAMELEN never counts
@@ -267,6 +289,10 @@ class RxEngine:
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
         self.hdr40 = None           # corerev 40+: the MAC header's length, until SPR 0x240 has it
+        self.air_end = 0            # clock at which the last frame started ends on the air
+        self.ctl_write = None       # the ucode's FIFOCTL1 writes since service(): (before, written)
+        if chip.hw.corerev >= 40:
+            chip.m.spr[SPR_RXE_FIFOCTL1] = FIFOCTL1_SET40
 
     # ---- the air side ----
     def rx_frame(self, frame, at=None):
@@ -280,6 +306,13 @@ class RxEngine:
         return self.frame is not None and \
             (not self.complete or self.held < len(self.frame.data) or not self.copy_done())
 
+    def fifoctl1_written(self, old, new):
+        """A ucode write of SPR_RXE_FIFOCTL1, `old` what it read before."""
+        self.ctl_write = (old if self.ctl_write is None else self.ctl_write[0], new)
+
+    def on_air(self):
+        return self.chip.clock < self.air_end
+
     def busy(self):
         return bool(self.queue) or self.frame is not None or self.fifo_busy_until is not None
 
@@ -291,7 +324,10 @@ class RxEngine:
             if self.held < len(self.frame.data) or not self.copy_done():
                 return c.clock + 1
         elif self.queue:
-            due.append(self.queue[0][0])
+            due.append(max(self.queue[0][0], self.air_end))
+        if self.on_air() and c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40 \
+                and c.hw.corerev >= 40:
+            due.append(self.air_end)
         return min(due) if due else None
 
     def _clock(self, us):
@@ -300,7 +336,7 @@ class RxEngine:
     def start(self, start, f):
         self.frame, self.received, self.held, self.copied = f, 0, 0, 0
         self.t_plcp = start + self._clock(f.plcp_us)
-        self.t_end = start + self._clock(f.air())
+        self.t_end = self.air_end = start + self._clock(f.air())
         self.levels = self.levels & {COND_RX_FIFOBUSY}
         self.complete, self.marked, self.push_due = False, 0, None
         self.streaming, self.cut = False, None
@@ -313,10 +349,14 @@ class RxEngine:
         if self.fifo_busy_until is not None and c.clock >= self.fifo_busy_until:
             self.fifo_busy_until = None
             self.levels.discard(COND_RX_FIFOBUSY)
+        if c.hw.corerev >= 40 and not self.on_air() and \
+                c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40:
+            self.read_back(c.m.spr[SPR_RXE_FIFOCTL1])
         if self.frame is None and not self.queue:
             return
-        if self.frame is None and self.queue and self.queue[0][0] <= c.clock:
-            self.start(*self.queue.pop(0))
+        if self.frame is None and self.queue and self.queue[0][0] <= c.clock and not self.on_air():
+            at, f = self.queue.pop(0)
+            self.start(max(at, self.air_end), f)
         f = self.frame
         if f is None or c.clock < self.t_plcp:
             return
@@ -496,15 +536,15 @@ class RxEngine:
             if self.lookup_due:
                 self.lookup_due = False
                 self.lookup()
-        ctl = spr.get(SPR_RXE_FIFOCTL1, 0)
-        if ctl & FIFOCTL1_STREAM and self.frame is not None and not self.streaming \
-                and self.cut is None:
+        if self.ctl_write is None:
+            return
+        old, ctl = self.ctl_write
+        self.ctl_write = None
+        f = self.frame
+        if ctl & FIFOCTL1_STREAM and f is not None and not self.streaming and self.cut is None:
             self.streaming = True
             self.log.append((c.clock, "streams"))
-        if not ctl & (FIFOCTL1_PUSH | FIFOCTL1_DROP):
-            return
-        f = self.frame
-        if ctl & FIFOCTL1_PUSH and f is not None:
+        if ctl & FIFOCTL1_PUSH and not old & FIFOCTL1_PUSH and f is not None:
             shm = c.m.shm
             base, length = spr.get(SPR_RXE_RXHDR_OFFSET, 0), spr.get(SPR_RXE_RXHDR_LEN, 0)
             words = [shm[(base + k) & (len(shm) - 1)] for k in range(length)]
@@ -514,12 +554,25 @@ class RxEngine:
             else:
                 self.push_due = (hdr, bool(ctl & FIFOCTL1_PAD))
                 self.log.append((c.clock, "push before the end"))
-        elif ctl & FIFOCTL1_DROP:
-            if f is not None:
-                self.dropped.append(f)
-                self.log.append((c.clock, "drop"))
-                self.end()
-        c.m.store(("spr", SPR_RXE_FIFOCTL1), ctl & ~(FIFOCTL1_PUSH | FIFOCTL1_DROP))
+        elif ctl & FIFOCTL1_DROP and f is not None:
+            self.dropped.append(f)
+            self.log.append((c.clock, "drop"))
+            self.end()
+        self.read_back(ctl, old)
+
+    def read_back(self, ctl, before=0):
+        """SPR_RXE_FIFOCTL1 as the hardware leaves it after `ctl`, written
+        over `before`."""
+        c = self.chip
+        if c.hw.corerev < 40:
+            value = ctl & ~(FIFOCTL1_PUSH | FIFOCTL1_DROP)
+        elif self.on_air():
+            value = (ctl | before & FIFOCTL1_HELD40) & ~FIFOCTL1_TAKEN40 | FIFOCTL1_SET40
+        else:
+            value = ctl & ~(FIFOCTL1_TAKEN40 | FIFOCTL1_HELD40) | FIFOCTL1_SET40
+        if value != ctl:
+            c.m.store(("spr", SPR_RXE_FIFOCTL1), value)
+            self.ctl_write = None
 
     def deliver(self, hdr, pad):
         c = self.chip
