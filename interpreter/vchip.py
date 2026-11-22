@@ -669,6 +669,8 @@ class Chip:
             self.hw_dirty = True
             if n == rxe.SPR_RXE_LOOKUP40 and new & 1:
                 self.rxe.lookup_due = True
+            elif n == rxe.SPR_RXE_FIFOCTL1:
+                self.rxe.fifoctl1_written(old, new)
             elif n in (txe.WATCHED40 if self.hw.corerev >= 40 else txe.WATCHED):
                 self.txe.writes.append((n, new))
         if self.recording:

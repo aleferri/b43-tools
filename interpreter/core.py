@@ -149,7 +149,8 @@ RADIO = IndirectBus("radio", 0x030, 0x031, CMD_D11)
 # Up to corerev 23: b43's B43_NPHY_4WI_ADDR and B43_NPHY_4WI_DATALO.
 FOUR_WIRE = FourWire(addr=0x00B, data=0x00D)
 
-# RXE_FIFOCTL1_SUSPEND, set before a MAC suspend.
+# RXE_FIFOCTL1_SUSPEND, set before a MAC suspend. From corerev 40 rxe.py
+# answers it, at the end of the frame on the air.
 RXE_SUSPEND = SprSelfClear(spr=0x004, bits=0x0004)
 # brcmsmac's psm_corectlsts: the arch15 ucode sets bit 5, waits for bit 13.
 CORECTL = SprFollow(spr=0x078, request=0x0020, ack=0x2000)
@@ -186,7 +187,7 @@ _PROFILES = (
                     handshakes=(RXE_SUSPEND, CORECTL, CRYPT_GO, ADDR_CMD), tx_go=TX_TEMPLATE,
                     read_from=(24, 26, 29, 30))),
     ((40, None), Core(corerev=42, isa=psm15, buses=(PHY_GO, RADIO),
-                      handshakes=(RXE_SUSPEND, CORECTL, ADDR_CMD), tx_go=TX_SERIAL,
+                      handshakes=(CORECTL, ADDR_CMD), tx_go=TX_SERIAL,
                       read_from=(40, 42, 49),
                       host_regs=(XMTFIFOCMD_BUSY, AGGFIFODATA0_GO))),
 )
