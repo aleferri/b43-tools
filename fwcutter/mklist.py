@@ -68,6 +68,8 @@ print("{")
 
 sym_re = re.compile(r"([0-9a-fA-F]+)\s+g\s+O\s+\.rodata\s+([0-9a-fA-F]+) d11([-_\s\w0-9]+)")
 ucode_re = re.compile(r"ucode(\d+)")
+# Stored as bytes, 7 per instruction: wlc_ucode_write_byte() in the driver
+packed_re = re.compile(r"ucode\d+_(sslpn|sslpn_nobt|lcn)$")
 
 for sym in syms:
 	sym = sym.strip()
@@ -101,6 +103,8 @@ for sym in syms:
 			type = "EXT_UCODE_1"
 		elif corerev >= 5 and corerev <= 14:
 			type = "EXT_UCODE_2"
+		elif packed_re.match(name):
+			type = "EXT_UCODE_3_PACKED"
 		else:
 			type = "EXT_UCODE_3"
 	if not type:

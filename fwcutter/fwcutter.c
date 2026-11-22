@@ -388,6 +388,12 @@ static void extract_or_identify(FILE *f, const char *dir,
 	buf = read_object(f, extract);
 
 	switch (extract->type) {
+	case EXT_UCODE_3_PACKED:
+		/* A byte array, the same in either byte order */
+		data_length = extract->length;
+		hdr.type = FW_TYPE_UCODE;
+		hdr.size = to_be32(data_length);
+		break;
 	case EXT_UCODE_3:
 		ucode_rev += 1;
 	case EXT_UCODE_2:
@@ -591,6 +597,7 @@ static void brcmsmac_extract(FILE *f, const struct extract *extract,
 	buf = read_object(f, extract);
 
 	switch (extract->type) {
+	case EXT_UCODE_3_PACKED:
 	case EXT_UCODE_3:
 		ucode_rev += 1;
 	case EXT_UCODE_2:

@@ -59,6 +59,7 @@ enum extract_type {
 	EXT_UCODE_1,   /* rev  <= 4 ucode */
 	EXT_UCODE_2,   /* rev 5..14 ucode */
 	EXT_UCODE_3,   /* rev >= 15 ucode */
+	EXT_UCODE_3_PACKED, /* rev >= 15 ucode, 7 bytes per instruction (sslpn, lcn) */
 	EXT_PCM,       /* "pcm" values   */
 	EXT_IV,        /* initial values */
 };
