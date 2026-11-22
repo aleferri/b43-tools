@@ -79,11 +79,16 @@ An A-MPDU is a frame with MPDUs `behind` it (opt-in). SPR 0x02B then holds
 the length of the MPDU the RXE parsed from the delimiter last: from a
 member's start its own (MPDU and FCS), which ucode30_mimo makes the mark
 (SPR 0x02A) of each member on the RT-AC56U, and from its end the next
-member's, or 0x8000 after the last. The next member streams once the
-ucode has pushed or dropped the one before, with no PLCP event and six
-zero bytes in place of the PLCP, as ucode30_mimo pushes members on the
-chip. On the chip it streams while the one before is still being pushed:
-the order here is a model.
+member's, or 0x8000 after the last. The mark counts the member's MPDU
+bytes, past its PLCP, and a member with others behind it ends when its
+last byte is in the RX buffer, with no end on the air: before reading
+FRAMELEN for such a member's RX header ucode30_mimo waits only for
+COND_RX_COMPLETE (0x0919, 0x0924, 0x0A04), as ucode42 does (0x0967), so
+on the chip neither can come before; a hypothesis. The next member streams
+once the ucode has pushed or dropped the one before, with no PLCP event
+and six zero bytes in place of the PLCP, as ucode30_mimo pushes members
+on the chip. On the chip it streams while the one before is still being
+pushed: the order here is a model.
 
 The ucode's writes of SPR_RXE_FIFOCTL1:
 
@@ -380,7 +385,8 @@ class RxEngine:
         if held == n and spr.get(SPR_RXE_STATUS, 0) & STATUS_DATA:
             spr[SPR_RXE_STATUS] &= ~STATUS_DATA
         mark = spr.get(SPR_RXE_MARK, 0)
-        if mark != self.marked and framelen >= mark and not self.complete:
+        count = held - PLCP_LEN if (f.behind or f.member) and held > PLCP_LEN else framelen
+        if mark != self.marked and count >= mark and not self.complete:
             self.marked = mark
             if mark:
                 c.events.add(COND_RX_COMPLETE)
@@ -389,7 +395,7 @@ class RxEngine:
         if self.copy_done() and not spr.get(SPR_RXE_STATUS, 0) & STATUS_COPIED \
                 and self.complete and held == n:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
-        if c.clock >= self.t_end and not self.complete:
+        if not self.complete and (held == n if f.behind else c.clock >= self.t_end):
             self.complete = True
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
