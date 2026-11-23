@@ -165,6 +165,11 @@ From corerev 40 the ucode needs more:
     such frame failed the FCS check; with 0x2082 (bit 6 clear) they are
     received; a preceding 0x20C0 does not prevent it. With `restart40` the
     model drops those bytes from the frame and clears the FCS verdict.
+  - SPR_RXE_RXHDR_OFFSET after a push: the chip takes the RX header out of
+    shared memory and the offset moves on by the words taken (784.2's
+    ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every push); a
+    ucode that waits for it (the open ucode, bounded) waited out its bound
+    here. With `hdr_offset_moves` the push moves it at once.
   - SPR 0x02B in an A-MPDU on the RT-AC56U's BCM4352: an MPDU's length
     shows at the PPDU's mark (FRAMELEN 6) and at each member boundary, and
     two reads back to back give the same value; once the ucode has written
@@ -323,6 +328,7 @@ class RxEngine:
         self.phy143_chip = False    # corerev 40+: PHY 0x143 as the BCM4352 reads at the PLCP; False: sub-bands only
         self.restart40 = False      # corerev 40+: FIFOCTL1 bit 6 written mid-frame restarts the copy (the chip)
         self.next40_mark = False    # corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000
+        self.hdr_offset_moves = False  # SPR_RXE_RXHDR_OFFSET moves past the header a push takes (the chip)
         self.lost = 0               # bytes a restarted copy dropped from this frame
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
@@ -621,6 +627,9 @@ class RxEngine:
             base, length = spr.get(SPR_RXE_RXHDR_OFFSET, 0), spr.get(SPR_RXE_RXHDR_LEN, 0)
             words = [shm[(base + k) & (len(shm) - 1)] for k in range(length)]
             hdr = b"".join(w.to_bytes(2, "little") for w in words)
+            if self.hdr_offset_moves:
+                # the chip: the push takes the header out of shared memory and the offset moves past it
+                spr[SPR_RXE_RXHDR_OFFSET] = (base + length) & 0xFFFF
             if self.complete:
                 self.deliver(hdr, bool(ctl & FIFOCTL1_PAD))
             else:
