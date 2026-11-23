@@ -28,11 +28,13 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
   + plcp_us   COND_RX_PLCP, held until the EOI.
               SPR_RXE_STATUS bit 12; without it the ucode counts the frame in
               SHM 0x0AE and flushes it (ucode30_mimo 0x0795, ucode42 0x0806).
-              Bit 13 until the last byte is in the RX buffer, COPY_LAG_US
-              after the frame's end: the end condition comes with it still
-              set, as on the RT-AC56U (spr.inc's SPR_RXE_0x1a). The LP ucode
-              aborts a reception with bit 12 and not bit 13 after 14 us
-              (ucode16_lp 0x0ED1), a hypothesis.
+              Bits 12 and 13 until the last byte is in the RX buffer,
+              COPY_LAG_US after the frame's end: the end condition comes with
+              them still set, as on the RT-AC56U (spr.inc's SPR_RXE_0x1a),
+              where both clear together in all 31 frame ends traced. The LP
+              ucode aborts a reception with bit 12 and not bit 13 after 14 us
+              (ucode16_lp 0x0ED1, ucode11 0x0E12), a hypothesis; frames do
+              not pass through that state at their end.
               SPR_RXE_ENCODING bit 13 for OFDM, and on arch15 bits 10..12 the
               frame format the ucode tells 0..3 apart by (ucode29_mimo
               0x07E5; 0 makes it CCK): 1 for OFDM.
@@ -64,6 +66,7 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               (corerev 42) FRAMELEN reads the whole frame wherever bit 14 is
               first seen set. Single frames wait for it before the push,
               where ucode42 puts FRAMELEN in the RX header (0x0968, 0x0D08).
+              It stays past the push until the next PLCP, as there.
   + air_us    COND_RX_COMPLETE, raised while the frame is in the RX buffer and
               latched until its EOI besides. COND_RX_FCS_GOOD, held until the
               EOI, if the FCS is good.
@@ -436,7 +439,7 @@ class RxEngine:
             spr[SPR_RXE_HDR40] = HDR40_IN | length << 1 | (HDR40_PAD if length % 4 == 2 else 0)
             self.log.append((c.clock, f"MAC header in, {length} bytes"))
         if held == n and spr.get(SPR_RXE_STATUS, 0) & STATUS_DATA:
-            spr[SPR_RXE_STATUS] &= ~STATUS_DATA
+            spr[SPR_RXE_STATUS] &= ~(STATUS_PLCP | STATUS_DATA)
         mark = spr.get(SPR_RXE_MARK, 0)
         count = held - PLCP_LEN if (f.behind or f.member) and held > PLCP_LEN else framelen
         if mark != self.marked and count >= mark and not self.complete:
@@ -605,8 +608,7 @@ class RxEngine:
 
     def end(self):
         spr, f = self.chip.m.spr, self.frame
-        spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & \
-            ~(STATUS_COPIED | STATUS_PLCP | STATUS_DATA)
+        spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & ~(STATUS_PLCP | STATUS_DATA)
         self.frame = None
         self.levels &= {COND_RX_FIFOBUSY}
         if f.behind:
