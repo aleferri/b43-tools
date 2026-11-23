@@ -198,6 +198,8 @@ def main():
                     help="corerev 40+: PHY 0x143 at the PLCP as the BCM4352 reads (rxe.phy143_chip)")
     ap.add_argument("--restart40", action="store_true",
                     help="corerev 40+: FIFOCTL1 bit 6 mid-frame restarts the copy, as on the BCM4352 (rxe.restart40)")
+    ap.add_argument("--next40-mark", action="store_true",
+                    help="corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000, as on the BCM4352 (rxe.next40_mark)")
     ap.add_argument("--ampdu", type=int, default=0, metavar="N",
                     help="an HT A-MPDU of N such MPDUs (MCS 7) instead of one frame")
     ap.add_argument("--phy-type", type=lambda x: int(x, 0), default=0x2,
@@ -213,6 +215,8 @@ def main():
         chip.rxe.phy143_chip = True
     if args.restart40:
         chip.rxe.restart40 = True
+    if args.next40_mark:
+        chip.rxe.next40_mark = True
 
     pcs, tx = set(), []
 
