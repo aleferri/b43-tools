@@ -125,8 +125,9 @@ def setup(fwdir, ucode, initvals=(), phy_type=0x2):
     chip = ls.chip
     chip.m.shm[0x10] = 2352
     # B43_SHM_SH_MIMO_MAXSYM as b43-next writes it with HT on the N-PHY
-    # (b43_chip_init): with 0 the mimo ucodes drop every HT frame.
-    if phy == "mimo":
+    # (b43_chip_init) and on the AC-PHY (phy_ac.c): with 0 the mimo ucodes
+    # and ucode42 (784.2) drop every HT frame at the mark.
+    if phy == "mimo" or corerev >= 40:
         chip.m.shm[0x5D] = 0xFFFF
     # B43_SHM_SH_CHAN as b43-next writes it: the chanspec on the AC-PHY
     # (channel 36, 80 MHz: 0xE02A), the channel number before it (1)
@@ -193,6 +194,10 @@ def main():
     ap.add_argument("--rx-buffer", metavar="BYTES|chip", default=None,
                     help="cut a frame the ucode has not let stream at BYTES ('chip': the "
                     "RT-AC56U's size for the corerev, rxe.RX_BUFFER_CHIP)")
+    ap.add_argument("--phy143-chip", action="store_true",
+                    help="corerev 40+: PHY 0x143 at the PLCP as the BCM4352 reads (rxe.phy143_chip)")
+    ap.add_argument("--restart40", action="store_true",
+                    help="corerev 40+: FIFOCTL1 bit 6 mid-frame restarts the copy, as on the BCM4352 (rxe.restart40)")
     ap.add_argument("--ampdu", type=int, default=0, metavar="N",
                     help="an HT A-MPDU of N such MPDUs (MCS 7) instead of one frame")
     ap.add_argument("--phy-type", type=lambda x: int(x, 0), default=0x2,
@@ -204,6 +209,10 @@ def main():
     if args.rx_buffer is not None:
         chip.rxe.rx_buffer = rxe.RX_BUFFER_CHIP.get(corerev) if args.rx_buffer == "chip" \
             else int(args.rx_buffer, 0)
+    if args.phy143_chip:
+        chip.rxe.phy143_chip = True
+    if args.restart40:
+        chip.rxe.restart40 = True
 
     pcs, tx = set(), []
 
