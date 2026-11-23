@@ -99,7 +99,11 @@ The ucode's writes of SPR_RXE_FIFOCTL1:
               frame's end, at its end. COND_RX_FIFOBUSY while the copy lasts:
               every ucode waits for it to rise and fall.
   bit 4       drop: the RX buffer is flushed and the frame ends (written
-              after a frame not taken, and after a push).
+              after a frame not taken, and after a push). FRAMELEN goes on
+              counting it to its last byte, past the RX buffer's cut, until
+              a PLCP: on the RT-AC56U one dropped at 0x86 bytes reaches
+              0x48C. Not an A-MPDU member with others behind it, after which
+              the next starts at once (below).
 
 A push needs bit 0 set by the write, as it reads back latched from corerev
 40 on. What a ucode write leaves in SPR_RXE_FIFOCTL1, before corerev 40 the
@@ -166,9 +170,7 @@ release is a hypothesis.
 A frame starts no earlier than the end on the air of the one before: one
 given to rx_frame() for an earlier time arrives then.
 
-Not modelled: FRAMELEN after a drop, which stops here where the chip's
-counts to the frame's end; which FIFOCTL1 bits clear themselves before
-corerev 40; the timing, overflow, bad PLCPs, frames back to back, the
+Not modelled: which FIFOCTL1 bits clear themselves before corerev 40; the timing, overflow, bad PLCPs, frames back to back, the
 BSSID match before corerev 40 (COND_RX_BSSMATCH is held for every frame),
 conditions 0x64, 0x67 and 0x68, SPR 0x240/0x244/0x274 beyond the above,
 and the crypto engine (its GO bit is in core.py).
@@ -290,6 +292,7 @@ class RxEngine:
         self.cut = None             # the bytes a cut frame kept
         self.hdr40 = None           # corerev 40+: the MAC header's length, until SPR 0x240 has it
         self.air_end = 0            # clock at which the last frame started ends on the air
+        self.dropped_on_air = None  # a frame dropped before its last byte, which FRAMELEN still counts
         self.ctl_write = None       # the ucode's FIFOCTL1 writes since service(): (before, written)
         if chip.hw.corerev >= 40:
             chip.m.spr[SPR_RXE_FIFOCTL1] = FIFOCTL1_SET40
@@ -323,6 +326,8 @@ class RxEngine:
         if self.frame is not None:
             if self.held < len(self.frame.data) or not self.copy_done():
                 return c.clock + 1
+        elif self.dropped_on_air is not None:
+            return c.clock + 1
         elif self.queue:
             due.append(max(self.queue[0][0], self.air_end))
         if self.on_air() and c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40 \
@@ -335,6 +340,7 @@ class RxEngine:
 
     def start(self, start, f):
         self.frame, self.received, self.held, self.copied = f, 0, 0, 0
+        self.dropped_on_air = None
         self.t_plcp = start + self._clock(f.plcp_us)
         self.t_end = self.air_end = start + self._clock(f.air())
         self.levels = self.levels & {COND_RX_FIFOBUSY}
@@ -352,6 +358,13 @@ class RxEngine:
         if c.hw.corerev >= 40 and not self.on_air() and \
                 c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40:
             self.read_back(c.m.spr[SPR_RXE_FIFOCTL1])
+        if self.dropped_on_air is not None:
+            d = self.dropped_on_air
+            n = len(d.data)
+            held = self.arrived(c.clock - self._clock(COPY_LAG_US), d)
+            c.m.spr[SPR_RXE_FRAMELEN] = min(held, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+            if held == n:
+                self.dropped_on_air = None
         if self.frame is None and not self.queue:
             return
         if self.frame is None and self.queue and self.queue[0][0] <= c.clock and not self.on_air():
@@ -457,9 +470,10 @@ class RxEngine:
         SPR_RXE_COPY_OFFSET (corerev 16..25, 30: 0x70C on corerev 30)."""
         return (self.chip.phy.read(0) >> 8) & 0xF in (PHYTYPE_HT, PHYTYPE_AC)
 
-    def arrived(self, clock):
-        """The bytes of the frame the PHY has handed over by clock."""
-        n = len(self.frame.data)
+    def arrived(self, clock, f=None):
+        """The bytes of the frame (or `f`, the last started) the PHY has
+        handed over by clock."""
+        n = len((f or self.frame).data)
         if clock < self.t_plcp:
             return 0
         if clock >= self.t_end:
@@ -557,6 +571,8 @@ class RxEngine:
         elif ctl & FIFOCTL1_DROP and f is not None:
             self.dropped.append(f)
             self.log.append((c.clock, "drop"))
+            if self.held < len(f.data) and not f.behind:
+                self.dropped_on_air = f
             self.end()
         self.read_back(ctl, old)
 
