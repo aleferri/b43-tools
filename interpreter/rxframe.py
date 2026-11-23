@@ -125,8 +125,9 @@ def setup(fwdir, ucode, initvals=(), phy_type=0x2):
     chip = ls.chip
     chip.m.shm[0x10] = 2352
     # B43_SHM_SH_MIMO_MAXSYM as b43-next writes it with HT on the N-PHY
-    # (b43_chip_init): with 0 the mimo ucodes drop every HT frame.
-    if phy == "mimo":
+    # (b43_chip_init) and on the AC-PHY (phy_ac.c): with 0 the mimo ucodes
+    # and ucode42 (784.2) drop every HT frame at the mark.
+    if phy == "mimo" or corerev >= 40:
         chip.m.shm[0x5D] = 0xFFFF
     # B43_SHM_SH_CHAN as b43-next writes it: the chanspec on the AC-PHY
     # (channel 36, 80 MHz: 0xE02A), the channel number before it (1)
