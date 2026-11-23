@@ -173,10 +173,16 @@ release is a hypothesis.
 A frame starts no earlier than the end on the air of the one before: one
 given to rx_frame() for an earlier time arrives then.
 
-Not modelled: which FIFOCTL1 bits clear themselves before corerev 40; the timing, overflow, bad PLCPs, frames back to back, the
-BSSID match before corerev 40 (COND_RX_BSSMATCH is held for every frame),
-conditions 0x64, 0x67 and 0x68, SPR 0x240/0x244/0x274 beyond the above,
-and the crypto engine (its GO bit is in core.py).
+Not modelled: which FIFOCTL1 bits clear themselves before corerev 40;
+the timing, overflow, bad PLCPs, frames back to back, the BSSID match
+before corerev 40 (COND_RX_BSSMATCH is held for every frame), conditions
+0x64, 0x67 and 0x68, SPR 0x240/0x244/0x274 beyond the above, and the
+crypto engine (its GO bit is in core.py). Nor condition 0x08,
+after which ucode42 counts rxcrsglitch (SHM 0x87) unless SPR_RXE_STATUS
+bit 7 is set (0x00B6, 0x07E3), nor the RX status bits other than 12..14:
+on the RT-AC56U bits 1, 5, 7, 9 and 11 are mostly set, the low ones
+differing between frames, and bit 15, which ucode42 takes as an abort
+(0x0927), once in 2068 samples, while FRAMELEN stood still for 510 us.
 """
 
 from dataclasses import dataclass, field, replace
