@@ -155,6 +155,16 @@ From corerev 40 the ucode needs more:
   - SPR 0x263 bit 12, set throughout on the RT-AC56U, during frames and
     between them: ucode42 waits for it before it takes COND_RX_COMPLETE
     (0x095F), and after the push.
+  - PHY 0x143 on the RT-AC56U's BCM4352 (5 GHz ch 36, HT20) reads 0x2C26 at
+    an HT frame's PLCP and 0x2C25 at an OFDM frame's (a test ucode reading
+    it at each PLCP): with `phy143_chip` the model gives those values.
+  - FIFOCTL1 bit 6 written while a frame streams: on the BCM4352 the RXE
+    drops what it holds past the PLCP and restarts the copy there. With the
+    open ucode's second step (0x20C2 at FRAMELEN 38) a dropped frame's SHM
+    copy began at the LLC ethertype, FRAMELEN ended 32 bytes short and every
+    such frame failed the FCS check; with 0x2082 (bit 6 clear) they are
+    received; a preceding 0x20C0 does not prevent it. With `restart40` the
+    model drops those bytes from the frame and clears the FCS verdict.
   - SPR 0x290 bit 0: without it a push reaches no RX DMA ring (RT-AC56U);
     ucode42 sets it (0x0D03).
   - SPR 0x293 counts the PLCPs: ucode42 puts its bits 0..5 in bits 10..15
@@ -211,10 +221,12 @@ SPR_RXE_LOOKUP40, SPR_RXE_LOOKUP40_DONE, SPR_RXE_LOOKUP40_IDX = 0x260, 0x271, 0x
 AMT_ROWS, AMT_F_VALID, AMT_F_SELF, AMT_F_BSSID = 64, 0x8000, 0x0008, 0x0002
 COND_RX_RAMATCH40, COND_RX_TABSS40, COND_RX_A3BSS40 = 0x61, 0x62, 0x63
 PHY_RXSUBBANDS40 = 0x143        # AC-PHY register, bits 12..15
+PHY143_CHIP = {1: 0x2C25, 2: 0x2C26}    # read at the PLCP on the RT-AC56U's BCM4352 (OFDM, HT)
 STAT40_B12 = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
+FIFOCTL1_RESTART = 0x0040       # corerev 40+, written while the frame streams: the copy restarts (restart40)
 FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
 RX_BUFFER_CHIP = {30: 383, 42: 1020}   # corerev: bytes a held frame is cut at on the RT-AC56U
 SPR_RXE_DMA40, DMA40_ON = 0x290, 0x0001
@@ -297,6 +309,9 @@ class RxEngine:
         self.dropped = []           # RxFrame
         self.log = []               # (clock, event)
         self.rx_buffer = None       # bytes a frame not streaming is cut at; None: no limit
+        self.phy143_chip = False    # corerev 40+: PHY 0x143 as the BCM4352 reads at the PLCP; False: sub-bands only
+        self.restart40 = False      # corerev 40+: FIFOCTL1 bit 6 written mid-frame restarts the copy (the chip)
+        self.lost = 0               # bytes a restarted copy dropped from this frame
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
         self.hdr40 = None           # corerev 40+: the MAC header's length, until SPR 0x240 has it
@@ -355,6 +370,7 @@ class RxEngine:
         self.levels = self.levels & {COND_RX_FIFOBUSY}
         self.complete, self.marked, self.push_due = False, 0, None
         self.streaming, self.cut = False, None
+        self.lost = 0
         if self.chip.hw.corerev >= 40:
             self.hdr40 = mac_header_len(f.data[PLCP_LEN:])
 
@@ -406,7 +422,12 @@ class RxEngine:
                     ((f.ftype if f.ftype is not None else int(f.ofdm)) << 10)
             if c.hw.corerev >= 40:
                 v = c.phy.read(PHY_RXSUBBANDS40)
-                c.phy.observe(PHY_RXSUBBANDS40, v & 0x0FFF | (f.subbands & 0xF) << 12)
+                if self.phy143_chip:
+                    # BCM4352 under 784.2, 5 GHz ch 36 HT20: 0x2C26 for an HT frame, 0x2C25 for OFDM
+                    v = PHY143_CHIP.get(f.ftype if f.ftype is not None else int(f.ofdm), v)
+                    c.phy.observe(PHY_RXSUBBANDS40, v)
+                else:
+                    c.phy.observe(PHY_RXSUBBANDS40, v & 0x0FFF | (f.subbands & 0xF) << 12)
             if len(f.data) >= PLCP_LEN + 2 and c.hw.corerev >= 40:
                 # The frame control word, where the corerev 42 ucode reads
                 # type and subtype (bits 2..7), a model.
@@ -462,7 +483,7 @@ class RxEngine:
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
             c.napping = False
-            if f.fcs_ok and self.cut is None:
+            if f.fcs_ok and self.cut is None and not self.lost:
                 c.events.add(COND_RX_FCS_GOOD)
             if self.copy_done() and held == n:
                 spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
@@ -564,6 +585,14 @@ class RxEngine:
         old, ctl = self.ctl_write
         self.ctl_write = None
         f = self.frame
+        if self.restart40 and c.hw.corerev >= 40 and f is not None and self.streaming \
+                and ctl & FIFOCTL1_RESTART and not self.complete:
+            # the BCM4352: bit 6 written once the frame streams drops what the RXE holds past the PLCP and
+            # restarts the copy there (a dropped frame's SHM copy began at the LLC ethertype, 32 bytes on)
+            n = max(0, spr.get(SPR_RXE_FRAMELEN, 0) - PLCP_LEN)
+            if n:
+                self.lost += n
+                self.log.append((c.clock, f"copy restarted: {n} bytes lost"))
         if ctl & FIFOCTL1_STREAM and f is not None and not self.streaming and self.cut is None:
             self.streaming = True
             self.log.append((c.clock, "streams"))
@@ -606,6 +635,8 @@ class RxEngine:
             self.log.append((c.clock, "push, no RX DMA: SPR 0x290 bit 0 clear"))
         else:
             data = self.frame.data if self.cut is None else self.frame.data[:self.cut]
+            if self.lost:
+                data = data[:PLCP_LEN] + data[PLCP_LEN + self.lost:]
             self.fifo.append(Pushed(hdr, pad, data, c.clock, self.frame))
             self.log.append((c.clock, "push"))
         self.end()
