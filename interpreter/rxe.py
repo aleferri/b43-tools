@@ -165,6 +165,30 @@ From corerev 40 the ucode needs more:
     such frame failed the FCS check; with 0x2082 (bit 6 clear) they are
     received; a preceding 0x20C0 does not prevent it. With `restart40` the
     model drops those bytes from the frame and clears the FCS verdict.
+  - The mark (SPR 0x02A) written equal to FRAMELEN on the RT-AC56U's
+    BCM4352: no COND_RX_COMPLETE follows. A frame the RXE holds at 6 bytes
+    when the ucode writes the mark 6 at its PLCP stays held (pdtrace: 3.6 ms
+    at FRAMELEN 6 until the next PLCP), and the open ucode left a third of a
+    station's 6 Mb/s frames unanswered that way until it went on to the
+    mark's work whenever FRAMELEN had reached the mark already. With
+    `mark40_equal` the model raises it only for a count that passes the mark
+    after the write.
+  - SPR_RXE_RXHDR_OFFSET after a push: the chip takes the RX header out of
+    shared memory and the offset moves on by the words taken (784.2's
+    ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every push); a
+    ucode that waits for it (the open ucode, bounded) waited out its bound
+    here. With `hdr_offset_moves` the push moves it at once.
+  - SPR 0x02B in an A-MPDU on the RT-AC56U's BCM4352: an MPDU's length
+    shows at the PPDU's mark (FRAMELEN 6) and at each member boundary, and
+    two reads back to back give the same value; once the ucode has written
+    the mark it reads 0x8000 to the member's end (784.2 sets the mark from
+    it and the host then samples 0x8000 inside every member; a ucode that
+    wrote mark 0 and FIFOCTL1 0x20C0 after reading it read 0x8000 at FRAMELEN
+    38); a mark written at the PLCP, before any of the MPDU's bytes, leaves
+    it (our gate read the length after the PLCP's mark 6). Which write
+    clears it, the mark's or FIFOCTL1's, is not separated; with
+    `next40_mark` a mark written once FRAMELEN is past the PLCP makes the
+    model read 0x8000.
   - SPR 0x290 bit 0: without it a push reaches no RX DMA ring (RT-AC56U);
     ucode42 sets it (0x0D03).
   - SPR 0x293 counts the PLCPs: ucode42 puts its bits 0..5 in bits 10..15
@@ -311,6 +335,9 @@ class RxEngine:
         self.rx_buffer = None       # bytes a frame not streaming is cut at; None: no limit
         self.phy143_chip = False    # corerev 40+: PHY 0x143 as the BCM4352 reads at the PLCP; False: sub-bands only
         self.restart40 = False      # corerev 40+: FIFOCTL1 bit 6 written mid-frame restarts the copy (the chip)
+        self.next40_mark = False    # corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000
+        self.hdr_offset_moves = False  # SPR_RXE_RXHDR_OFFSET moves past the header a push takes (the chip)
+        self.mark40_equal = False   # corerev 40+: a mark written equal to the frame's count raises no event (the chip)
         self.lost = 0               # bytes a restarted copy dropped from this frame
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
@@ -332,6 +359,22 @@ class RxEngine:
         """A frame is on the air: what the ucode polls may still change."""
         return self.frame is not None and \
             (not self.complete or self.held < len(self.frame.data) or not self.copy_done())
+
+    def mark_written(self):
+        """SPR_RXE_MARK written (corerev 40+). `next40_mark`: inside an
+        A-MPDU's MPDU, SPR 0x02B then reads 0x8000 until the MPDU's end.
+        `mark40_equal`: a mark equal to the frame's count when written
+        raises no COND_RX_COMPLETE."""
+        c, f = self.chip, self.frame
+        if self.mark40_equal and c.hw.corerev >= 40 and f is not None and not self.complete:
+            mark = c.m.spr.get(SPR_RXE_MARK, 0)
+            n = c.m.spr.get(SPR_RXE_FRAMELEN, 0)
+            count = n - PLCP_LEN if (f.behind or f.member) and n > PLCP_LEN else n
+            if mark and count == mark:
+                self.marked = mark
+        if self.next40_mark and c.hw.corerev >= 40 and f is not None and (f.behind or f.member) \
+                and not self.complete and c.m.spr.get(SPR_RXE_FRAMELEN, 0) > PLCP_LEN:
+            c.m.spr[SPR_RXE_NEXT] = NEXT_NONE
 
     def fifoctl1_written(self, old, new):
         """A ucode write of SPR_RXE_FIFOCTL1, `old` what it read before."""
@@ -601,6 +644,9 @@ class RxEngine:
             base, length = spr.get(SPR_RXE_RXHDR_OFFSET, 0), spr.get(SPR_RXE_RXHDR_LEN, 0)
             words = [shm[(base + k) & (len(shm) - 1)] for k in range(length)]
             hdr = b"".join(w.to_bytes(2, "little") for w in words)
+            if self.hdr_offset_moves:
+                # the chip: the push takes the header out of shared memory and the offset moves past it
+                spr[SPR_RXE_RXHDR_OFFSET] = (base + length) & 0xFFFF
             if self.complete:
                 self.deliver(hdr, bool(ctl & FIFOCTL1_PAD))
             else:
