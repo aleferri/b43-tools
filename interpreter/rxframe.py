@@ -202,6 +202,8 @@ def main():
                     help="corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000, as on the BCM4352 (rxe.next40_mark)")
     ap.add_argument("--hdr-offset-moves", action="store_true",
                     help="SPR_RXE_RXHDR_OFFSET moves past the header a push takes, as on the chip (rxe.hdr_offset_moves)")
+    ap.add_argument("--mark40-equal", action="store_true",
+                    help="corerev 40+: a mark written equal to the frame's count raises no COND_RX_COMPLETE, as on the BCM4352 (rxe.mark40_equal)")
     ap.add_argument("--ampdu", type=int, default=0, metavar="N",
                     help="an HT A-MPDU of N such MPDUs (MCS 7) instead of one frame")
     ap.add_argument("--phy-type", type=lambda x: int(x, 0), default=0x2,
@@ -221,6 +223,8 @@ def main():
         chip.rxe.next40_mark = True
     if args.hdr_offset_moves:
         chip.rxe.hdr_offset_moves = True
+    if args.mark40_equal:
+        chip.rxe.mark40_equal = True
 
     pcs, tx = set(), []
 
