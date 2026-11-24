@@ -359,6 +359,7 @@ class RxEngine:
         self.levels = set()         # conditions held while the frame lasts
         self.complete = False
         self.marked = 0             # the SPR_RXE_MARK the frame's bytes reached last
+        self.counted = 0            # the count the mark was last compared with
         self.push_due = None        # (rxhdr, pad) of a push made before the end
         self.lookup_due = False      # a write of command 1 to SPR 0x260
         self.fifo_busy_until = None # clock at which the push's copy ends
@@ -405,9 +406,7 @@ class RxEngine:
         c, f = self.chip, self.frame
         if self.mark40_equal and c.hw.corerev >= 40 and f is not None and not self.complete:
             mark = c.m.spr.get(SPR_RXE_MARK, 0)
-            n = c.m.spr.get(SPR_RXE_FRAMELEN, 0)
-            count = n - PLCP_LEN if (f.behind or f.member) and n > PLCP_LEN else n
-            if mark and count == mark:
+            if mark and self.counted == mark:
                 self.marked = mark
         if self.next40_mark and c.hw.corerev >= 40 and f is not None and (f.behind or f.member) \
                 and not self.complete and c.m.spr.get(SPR_RXE_FRAMELEN, 0) > PLCP_LEN:
@@ -448,7 +447,7 @@ class RxEngine:
         self.t_plcp = start + self._clock(f.plcp_us)
         self.t_end = self.air_end = start + self._clock(f.air())
         self.levels = self.levels & {COND_RX_FIFOBUSY}
-        self.complete, self.marked, self.push_due = False, 0, None
+        self.complete, self.marked, self.counted, self.push_due = False, 0, 0, None
         self.streaming, self.cut = False, None
         self.lost = 0
         self.pulsed, self.hold_until = False, None
@@ -555,7 +554,7 @@ class RxEngine:
             spr[SPR_RXE_STATUS] &= ~(STATUS_PLCP | STATUS_DATA)
         mark = spr.get(SPR_RXE_MARK, 0)
         kept = held - self.lost
-        count = kept - PLCP_LEN if (f.behind or f.member) and kept > PLCP_LEN else framelen
+        count = self.counted = kept - PLCP_LEN if (f.behind or f.member) and kept > PLCP_LEN else framelen
         if mark != self.marked and count >= mark and not self.complete:
             self.marked = mark
             if mark:
