@@ -189,6 +189,14 @@ From corerev 40 the ucode needs more:
     clears it, the mark's or FIFOCTL1's, is not separated; with
     `next40_mark` a mark written once FRAMELEN is past the PLCP makes the
     model read 0x8000.
+  - A VHT PPDU is always an A-MPDU, also with one MPDU, and SPR 0x02B holds
+    its length at the gate. On the RT-AC56U's BCM4352, of 11039 such frames
+    of a phone (VHT80, upload) 8262 read the length alone and 2777 with bit
+    14 set, e.g. 0x4065; none read 0x8000. About as many frames were repeated
+    by the phone to its retry limit while the open ucode answered them with a
+    Block Ack (2881 duplicates dropped). Bit 14 is taken for the delimiter's
+    EOF, an S-MPDU, which wants an ACK. `RxFrame.eof` False and True give
+    those two; None keeps the model's 0x8000 of a frame that is not an A-MPDU.
   - SPR 0x290 bit 0: without it a push reaches no RX DMA ring (RT-AC56U);
     ucode42 sets it (0x0D03).
   - SPR 0x293 counts the PLCPs: ucode42 puts its bits 0..5 in bits 10..15
@@ -236,6 +244,7 @@ SPR_RXE_FC40 = 0x241
 SPR_RXE_MARK = 0x02A            # spr.inc's SPR_RXE_0x54
 SPR_RXE_NEXT = 0x02B            # spr.inc's SPR_RXE_0x56
 NEXT_NONE = 0x8000
+NEXT_EOF = 0x4000               # the delimiter's EOF (corerev 40+, RxFrame.eof)
 SPR_RXE_STAT40 = 0x263
 SPR_RXE_HDR40 = 0x240
 HDR40_IN, HDR40_PAD = 0x0001, 0x0100
@@ -279,6 +288,7 @@ class RxFrame:
     subbands: int = 0xF         # corerev 40+: the 20 MHz sub-bands it came on
     behind: tuple = ()          # A-MPDU: the MPDUs after this one (MPDU and FCS each)
     member: bool = False        # an A-MPDU member after the first: no PLCP event
+    eof: bool = None            # corerev 40+: a VHT PPDU of one MPDU: its delimiter's EOF (True: an S-MPDU), None: as a frame alone
 
     def air(self):
         """From the first bit to the last, in microseconds."""
@@ -479,8 +489,8 @@ class RxEngine:
                 spr[SPR_RXE_TSF] = c.tsf() & 0xFFFF
             if c.hw.corerev >= 40:
                 spr[SPR_RXE_COUNT40] = (spr.get(SPR_RXE_COUNT40, 0) + 1) & 0xFFFF
-            if f.behind or f.member:
-                spr[SPR_RXE_NEXT] = (len(f.data) - PLCP_LEN) & 0x0FFF
+            if f.behind or f.member or f.eof is not None:
+                spr[SPR_RXE_NEXT] = (len(f.data) - PLCP_LEN) & 0x0FFF | (NEXT_EOF if f.eof else 0)
             if f.member:
                 self.log.append((c.clock, "member"))
             else:
@@ -530,7 +540,7 @@ class RxEngine:
                 c.events.add(COND_RX_FCS_GOOD)
             if self.copy_done() and held == n:
                 spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
-            if f.behind or f.member:
+            if f.behind or f.member or f.eof is not None:
                 spr[SPR_RXE_NEXT] = (len(f.behind[0]) & 0x0FFF) if f.behind else NEXT_NONE
             self.log.append((c.clock, "complete"))
             if self.push_due:
