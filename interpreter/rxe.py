@@ -503,13 +503,11 @@ class RxEngine:
                 spr[SPR_RXE_ENCODING] = spr[SPR_RXE_ENCODING] & ~0x1C00 | \
                     ((f.ftype if f.ftype is not None else int(f.ofdm)) << 10)
             if c.hw.corerev >= 40:
-                v = c.phy.read(PHY_RXSUBBANDS40)
+                v = c.phy.read(PHY_RXSUBBANDS40) & 0x0FFF | (f.subbands & 0xF) << 12
                 if self.phy143_chip:
                     # BCM4352 under 784.2, 5 GHz ch 36 HT20: 0x2C26 for an HT frame, 0x2C25 for OFDM
                     v = PHY143_CHIP.get(f.ftype if f.ftype is not None else int(f.ofdm), v)
-                    c.phy.observe(PHY_RXSUBBANDS40, v)
-                else:
-                    c.phy.observe(PHY_RXSUBBANDS40, v & 0x0FFF | (f.subbands & 0xF) << 12)
+                c.phy.observe(PHY_RXSUBBANDS40, v)
             if len(f.data) >= PLCP_LEN + 2 and c.hw.corerev >= 40:
                 # The frame control word, where the corerev 42 ucode reads
                 # type and subtype (bits 2..7), a model.
