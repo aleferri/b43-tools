@@ -309,6 +309,7 @@ class RxFrame:
     behind: tuple = ()          # A-MPDU: the MPDUs after this one (MPDU and FCS each)
     member: bool = False        # an A-MPDU member after the first: no PLCP event
     eof: bool = None            # corerev 40+: a VHT PPDU of one MPDU: its delimiter's EOF (True: an S-MPDU), None: as a frame alone
+    behind_ok: tuple = ()       # A-MPDU: the FCS verdicts of the MPDUs `behind`, good where it is shorter
 
     def air(self):
         """From the first bit to the last, in microseconds."""
@@ -753,8 +754,12 @@ class RxEngine:
         self.levels &= {COND_RX_FIFOBUSY}
         if f.behind:
             # The next A-MPDU member, at the rate of the one before.
+            # its FCS verdict is its own: the one before's falls (the BCM4352: bad
+            # members after good ones are told apart).
+            self.chip.events.discard(COND_RX_FCS_GOOD)
             mpdu = f.behind[0]
             air = None if f.air_us is None else \
                 (f.air_us - f.plcp_us) * len(mpdu) / max(1, len(f.data) - PLCP_LEN)
             self.start(self.chip.clock, replace(f, data=bytes(PLCP_LEN) + mpdu, behind=f.behind[1:],
+                                                fcs_ok=f.behind_ok[0] if f.behind_ok else True, behind_ok=f.behind_ok[1:],
                                                 member=True, plcp_us=0.0, air_us=air))
