@@ -170,7 +170,15 @@ def beacon_summary(ls):
     chip, rec = ls.chip, ls.rec
     return (f"TBTTs {len(rec.tbtt_log)}  TX conditions {len(rec.tx_log)}  "
             f"IRQ bits {sorted({bits for *_x, bits in rec.irqs})}  final pc {chip.m.pc:#06x}"
+            + off_primary(chip)
             + (f"  stopped: {chip.stopped}" if chip.stopped else ""))
+
+
+def off_primary(chip):
+    """The beacons no station hears, if any: not on the primary 20 MHz channel."""
+    bad = [(sb, pri) for _t, sb, pri in chip.beacons if sb != pri]
+    return (f"  beacons off the primary {len(bad)}/{len(chip.beacons)}, sub-band "
+            f"{bad[0][0]} not {bad[0][1]}" if bad else "")
 
 
 def main():
