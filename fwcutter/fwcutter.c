@@ -598,6 +598,9 @@ static void brcmsmac_extract(FILE *f, const struct extract *extract,
 
 	switch (extract->type) {
 	case EXT_UCODE_3_PACKED:
+		data_length = extract->length;
+		size = to_le32(data_length);
+		break;
 	case EXT_UCODE_3:
 		ucode_rev += 1;
 	case EXT_UCODE_2:
