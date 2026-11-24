@@ -169,7 +169,8 @@ From corerev 40 the ucode needs more:
     copy began at the LLC ethertype, FRAMELEN ended 32 bytes short and every
     such frame failed the FCS check; with 0x2082 (bit 6 clear) they are
     received; a preceding 0x20C0 does not prevent it. With `restart40` the
-    model drops those bytes from the frame and clears the FCS verdict.
+    model drops those bytes from the frame, FRAMELEN and the SHM copy, and
+    clears the FCS verdict.
   - The mark (SPR 0x02A) written equal to FRAMELEN on the RT-AC56U's
     BCM4352: no COND_RX_COMPLETE follows. A frame the RXE holds at 6 bytes
     when the ucode writes the mark 6 at its PLCP stays held (pdtrace: 3.6 ms
@@ -471,7 +472,7 @@ class RxEngine:
             d = self.dropped_on_air
             n = len(d.data)
             held = self.arrived(c.clock - self._clock(COPY_LAG_US), d)
-            c.m.spr[SPR_RXE_FRAMELEN] = min(held, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+            c.m.spr[SPR_RXE_FRAMELEN] = min(held, n - FRAMELEN_SHORT.get(c.hw.corerev, 0)) - self.lost
             if held == n:
                 self.dropped_on_air = None
         if self.frame is None and not self.queue:
@@ -542,10 +543,10 @@ class RxEngine:
             held = 2
         self.held = held
         framelen = min(held if self.cut is None or self.hold_until is not None and c.clock < self.hold_until
-                       else self.cut, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+                       else self.cut, n - FRAMELEN_SHORT.get(c.hw.corerev, 0)) - self.lost
         if framelen != spr.get(SPR_RXE_FRAMELEN):
             spr[SPR_RXE_FRAMELEN] = framelen
-        self.copy(held)
+        self.copy(held - self.lost)
         if self.hdr40 is not None and held >= PLCP_LEN + self.hdr40:
             length, self.hdr40 = self.hdr40, None
             spr[SPR_RXE_HDR40] = HDR40_IN | length << 1 | (HDR40_PAD if length % 4 == 2 else 0)
@@ -553,7 +554,8 @@ class RxEngine:
         if held == n and spr.get(SPR_RXE_STATUS, 0) & STATUS_DATA:
             spr[SPR_RXE_STATUS] &= ~(STATUS_PLCP | STATUS_DATA)
         mark = spr.get(SPR_RXE_MARK, 0)
-        count = held - PLCP_LEN if (f.behind or f.member) and held > PLCP_LEN else framelen
+        kept = held - self.lost
+        count = kept - PLCP_LEN if (f.behind or f.member) and kept > PLCP_LEN else framelen
         if mark != self.marked and count >= mark and not self.complete:
             self.marked = mark
             if mark:
@@ -605,23 +607,29 @@ class RxEngine:
         span = max(1, self.t_end - self.t_plcp)
         return PLCP_LEN + (n - PLCP_LEN) * (clock - self.t_plcp) // span
 
+    def kept(self):
+        """The frame's bytes without those a restarted copy dropped."""
+        data = self.frame.data
+        return data[:PLCP_LEN] + data[PLCP_LEN + self.lost:] if self.lost else data
+
     def copy_done(self):
         f = self.frame
         return f is not None and \
-            self.copied >= min(len(f.data), self.chip.m.spr.get(SPR_RXE_COPY_LEN, 0))
+            self.copied >= min(len(f.data) - self.lost, self.chip.m.spr.get(SPR_RXE_COPY_LEN, 0))
 
     def copy(self, upto):
         """The bytes inside the copy window that arrived COPY_LAG_US ago, to
         shared memory."""
         c = self.chip
         spr, shm = c.m.spr, c.m.shm
-        limit = min(upto, len(self.frame.data), spr.get(SPR_RXE_COPY_LEN, 0))
-        base = spr.get(SPR_RXE_COPY_OFFSET, 0) + (1 if self.copy_lead() else 0)
         data = self.frame.data
+        limit = min(upto, len(data) - self.lost, spr.get(SPR_RXE_COPY_LEN, 0))
+        base = spr.get(SPR_RXE_COPY_OFFSET, 0) + (1 if self.copy_lead() else 0)
         while self.copied < limit:
             i = self.copied & ~1
             end = min(i + 2, limit)
-            shm[(base + i // 2) & (len(shm) - 1)] = int.from_bytes(data[i:end], "little")
+            j = i if i < PLCP_LEN else i + self.lost
+            shm[(base + i // 2) & (len(shm) - 1)] = int.from_bytes(data[j:j + end - i], "little")
             self.copied = end
 
     # ---- the ucode side ----
@@ -686,6 +694,7 @@ class RxEngine:
             n = max(0, spr.get(SPR_RXE_FRAMELEN, 0) - PLCP_LEN)
             if n:
                 self.lost += n
+                self.copied = min(self.copied, PLCP_LEN)
                 self.log.append((c.clock, f"copy restarted: {n} bytes lost"))
         if self.push_hold and c.hw.corerev >= 40:
             if ctl & FIFOCTL1_DROP:
@@ -742,9 +751,7 @@ class RxEngine:
         if c.hw.corerev >= 40 and not c.m.spr.get(SPR_RXE_DMA40, 0) & DMA40_ON:
             self.log.append((c.clock, "push, no RX DMA: SPR 0x290 bit 0 clear"))
         else:
-            data = self.frame.data if self.cut is None else self.frame.data[:self.cut]
-            if self.lost:
-                data = data[:PLCP_LEN] + data[PLCP_LEN + self.lost:]
+            data = self.kept() if self.cut is None else self.frame.data[:self.cut]
             self.fifo.append(Pushed(hdr, pad, data, c.clock, self.frame))
             self.log.append((c.clock, "push"))
         self.end()
