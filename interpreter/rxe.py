@@ -105,7 +105,12 @@ The ucode's writes of SPR_RXE_FIFOCTL1:
               ucode42 14), two bytes of padding if bit 5 is set, then the
               frame, go to the FIFO and the frame ends; made before the
               frame's end, at its end. COND_RX_FIFOBUSY while the copy lasts:
-              every ucode waits for it to rise and fall.
+              every ucode waits for it to rise and fall. On the chip
+              SPR_RXE_RXHDR_OFFSET then moves on by the words taken (784.2's
+              ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every
+              push); a ucode that waits for it (the open ucode, bounded)
+              waited out its bound here. With `hdr_offset_moves` the push
+              moves it at once.
   bit 4       drop: the RX buffer is flushed and the frame ends (written
               after a frame not taken, and after a push). FRAMELEN goes on
               counting it to its last byte, past the RX buffer's cut, until
@@ -192,11 +197,6 @@ From corerev 40 the ucode needs more:
     trigger is inferred from the order of the two writes, not separated from
     the push overlapping the transmission; the hold's end and the bytes kept
     are those seen for 1536-byte frames; the status words are not modelled.
-  - SPR_RXE_RXHDR_OFFSET after a push: the chip takes the RX header out of
-    shared memory and the offset moves on by the words taken (784.2's
-    ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every push); a
-    ucode that waits for it (the open ucode, bounded) waited out its bound
-    here. With `hdr_offset_moves` the push moves it at once.
   - SPR 0x02B in an A-MPDU on the RT-AC56U's BCM4352: an MPDU's length
     shows at the PPDU's mark (FRAMELEN 6) and at each member boundary, and
     two reads back to back give the same value; once the ucode has written
