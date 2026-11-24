@@ -102,6 +102,11 @@ GPTS = ((0x123, 0x125, 0x127, 0x129, 0x12B),
 GPT_STAT = {g[0]: i for i, g in enumerate(GPTS)}
 GPT_CNT = {s: i for i, g in enumerate(GPTS) for s in g[1:3]}
 GPT_EN, GPT_8MHZ = 0x8000, 0x4000
+# Corerev 40+ beacons. A station hears only the primary 20 MHz channel: a
+# beacon sent on another sub-band of the block reaches none (b43-next#43).
+SPR_TX_SEND40, TX_BEACON40 = 0x320, 0x8000  # (a queued frame is 0x8001)
+SPR_TX_PHYCTL1 = 0x08A          # the PHY control word 1 in use: sub-band in bits 2:0
+SHM_CHANSPEC = 0xA0 // 2        # B43_SHM_SH_CHAN, the primary's sub-band in bits 10:8
 IRQ_MAC_SUSPENDED = 0x0001
 HOSTF_WORDS = (0x05E >> 1, 0x060 >> 1, 0x062 >> 1, 0x078 >> 1, 0x0D4 >> 1)
 OBJADDR, OBJDATA, OBJDATA_HI = 0x160, 0x164, 0x166
@@ -248,6 +253,7 @@ class Chip:
         self.m.on_eoi = self.eoi
         self.tx = tx                    # (ifs, start, done) or None
         self.events = set()             # raised conditions held until EOI
+        self.beacons = []               # corerev 40+: (clock, sub-band, the primary's)
         self.pending = []               # (step, condition) still to raise
         self.mhz = mhz                  # instructions per TSF microsecond
         self.clock = 0                  # time, in PSM instructions
@@ -594,6 +600,10 @@ class Chip:
                 new & self.hw.tx_go.bits == self.hw.tx_go.bits:
             self.pending.append((self.steps + start, COND_TX_POWER))
             self.pending.append((self.steps + done, COND_TX_DONE))
+            if new == TX_BEACON40 and loc == ("spr", SPR_TX_SEND40):
+                # (clock, the 20 MHz sub-band it goes out on, the primary's)
+                self.beacons.append((self.clock, self.m.spr.get(SPR_TX_PHYCTL1, 0) & 7,
+                                     self.m.shm[SHM_CHANSPEC] >> 8 & 7))
 
     def conditions(self):
         """The external conditions, for a jext/jnext."""
