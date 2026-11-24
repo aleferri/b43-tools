@@ -40,7 +40,12 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               0x07E5; 0 makes it CCK): 1 for OFDM.
               The PHY's six RX status words: SPR_RXE_PHYRXSTAT0..3 and SPR
               0x022/0x023 (spr.inc's SPR_RXE_0x44/0x46), which ucode42 copies
-              to RX header words 2..7 and ucode30_mimo, 2..5.
+              to RX header words 2..7 and ucode30_mimo, 2..5. On corerev 40+
+              an A-MPDU's come at the end of its last MPDU; until then the
+              words are the reception's before (the RT-AC56U's BCM4352: every
+              member but the last had the header words 2..7 of a failed
+              reception before it, under the open ucode, and 784.2 marks
+              only the last one's RX status valid, MAC status bit 24).
               SPR 0x11F (spr.inc's SPR_TSF_0x3e) the TSF's low word, the RX
               header's mac_time (word 10).
               COND_RX_RAMATCH and COND_RX_BSSMATCH as given, while the frame
@@ -479,10 +484,8 @@ class RxEngine:
         if self.received == 0:
             spr[SPR_RXE_ENCODING] = (spr.get(SPR_RXE_ENCODING, 0) & ~ENCODING_OFDM) | \
                 (ENCODING_OFDM if f.ofdm else 0)
-            for n, v in zip((SPR_RXE_PHYRXSTAT0, SPR_RXE_PHYRXSTAT1,
-                             SPR_RXE_PHYRXSTAT2, SPR_RXE_PHYRXSTAT3,
-                             SPR_RXE_PHYRXSTAT4, SPR_RXE_PHYRXSTAT5), f.phyrxstat):
-                spr[n] = v & 0xFFFF
+            if not (c.hw.corerev >= 40 and (f.behind or f.member)):
+                self.phy_status(f)
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & ~STATUS_COPIED | \
                 STATUS_PLCP | STATUS_DATA
             if c.hw.corerev >= 40:
@@ -560,6 +563,8 @@ class RxEngine:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
         if not self.complete and (held == n if f.behind else c.clock >= self.t_end):
             self.complete = True
+            if c.hw.corerev >= 40 and f.member and not f.behind:
+                self.phy_status(f)
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
             c.napping = False
@@ -572,6 +577,13 @@ class RxEngine:
             self.log.append((c.clock, "complete"))
             if self.push_due:
                 self.deliver(*self.push_due)
+
+    def phy_status(self, f):
+        """The PHY's six RX status words, as the ucode reads them."""
+        for n, v in zip((SPR_RXE_PHYRXSTAT0, SPR_RXE_PHYRXSTAT1,
+                         SPR_RXE_PHYRXSTAT2, SPR_RXE_PHYRXSTAT3,
+                         SPR_RXE_PHYRXSTAT4, SPR_RXE_PHYRXSTAT5), f.phyrxstat):
+            self.chip.m.spr[n] = v & 0xFFFF
 
     def copy_lead(self):
         """Whether the frame starts one word into the copy: with the HT and
