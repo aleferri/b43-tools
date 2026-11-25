@@ -173,6 +173,19 @@ From corerev 40 the ucode needs more:
     mark's work whenever FRAMELEN had reached the mark already. With
     `mark40_equal` the model raises it only for a count that passes the mark
     after the write.
+  - A streamed frame pushed after the response's RX suspend pulse (FIFOCTL1
+    0x0004, 0), while the response is on the air: on the BCM4352 (RT-AC56U)
+    the next frame is then held. Of the full-size 6 Mb/s frames after the
+    open ucode's ACK 30 of 36 (WPA2) and 26 of 31 (open) stayed at FRAMELEN
+    2 for 1.6-1.7 ms of their 2.0, SPR 0x00D at 0xFA80 (a good frame 0x3A80)
+    and 0x00E at 0x4400 (0x0400), came up to 506 or 522 bytes at once, failed
+    the FCS and got no answer. 784.2, which pushes before its pulse, had 16
+    of 17 received; a frame after a drop (FIFOCTL1 0x0014, 0x0010, 0) is
+    received, and that reset at the ACK's TX_DONE left no hold (five runs).
+    With `push_hold` the model holds the next frame until a drop's reset. The
+    trigger is inferred from the order of the two writes, not separated from
+    the push overlapping the transmission; the hold's end and the bytes kept
+    are those seen for 1536-byte frames; the status words are not modelled.
   - SPR_RXE_RXHDR_OFFSET after a push: the chip takes the RX header out of
     shared memory and the offset moves on by the words taken (784.2's
     ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every push); a
@@ -258,6 +271,8 @@ PHY143_CHIP = {1: 0x2C25, 2: 0x2C26}    # read at the PLCP on the RT-AC56U's BCM
 STAT40_B12 = 0x1000
 
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
+FIFOCTL1_SUSPEND = 0x0004       # the response's RX suspend pulse (0x0004, 0), push_hold
+PUSH_HOLD_BYTES, PUSH_HOLD_KEPT = 1232, 506    # push_hold: bytes until the hold ends, bytes then kept
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
 FIFOCTL1_RESTART = 0x0040       # corerev 40+, written while the frame streams: the copy restarts (restart40)
 FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
@@ -348,6 +363,10 @@ class RxEngine:
         self.next40_mark = False    # corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000
         self.hdr_offset_moves = False  # SPR_RXE_RXHDR_OFFSET moves past the header a push takes (the chip)
         self.mark40_equal = False   # corerev 40+: a mark written equal to the frame's count raises no event (the chip)
+        self.push_hold = False      # corerev 42: a push after the RX suspend pulse holds the next frame (the chip)
+        self.pulsed = False         # push_hold: FIFOCTL1 bit 2 written with the frame received and not pushed
+        self.stuck = False          # push_hold: the next frame is held
+        self.hold_until = None      # push_hold: the clock the held frame's bytes come at
         self.lost = 0               # bytes a restarted copy dropped from this frame
         self.streaming = False      # the ucode let the frame stream (FIFOCTL1 bit 7)
         self.cut = None             # the bytes a cut frame kept
@@ -424,6 +443,11 @@ class RxEngine:
         self.complete, self.marked, self.push_due = False, 0, None
         self.streaming, self.cut = False, None
         self.lost = 0
+        self.pulsed, self.hold_until = False, None
+        if self.stuck:
+            self.hold_until = min(self.t_plcp + self._clock(8 * PUSH_HOLD_BYTES / 6), self.t_end)
+            self.cut = min(PUSH_HOLD_KEPT, len(f.data))
+            self.log.append((self.chip.clock, "held: a push came after the RX suspend pulse"))
         if self.chip.hw.corerev >= 40:
             self.hdr40 = mac_header_len(f.data[PLCP_LEN:])
 
@@ -509,8 +533,11 @@ class RxEngine:
             self.log.append((c.clock, f"cut at {self.rx_buffer} bytes: the RX buffer full"))
         if self.cut is not None:
             held = self.cut if c.clock < self.t_end else n
+        if self.hold_until is not None and c.clock < self.hold_until:
+            held = 2
         self.held = held
-        framelen = min(held if self.cut is None else self.cut, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
+        framelen = min(held if self.cut is None or self.hold_until is not None and c.clock < self.hold_until
+                       else self.cut, n - FRAMELEN_SHORT.get(c.hw.corerev, 0))
         if framelen != spr.get(SPR_RXE_FRAMELEN):
             spr[SPR_RXE_FRAMELEN] = framelen
         self.copy(held)
@@ -646,6 +673,14 @@ class RxEngine:
             if n:
                 self.lost += n
                 self.log.append((c.clock, f"copy restarted: {n} bytes lost"))
+        if self.push_hold and c.hw.corerev >= 40:
+            if ctl & FIFOCTL1_DROP:
+                self.stuck = False      # the drop's reset: 0x0014, 0x0010, 0
+            elif ctl & FIFOCTL1_SUSPEND and f is not None and self.complete and self.streaming:
+                self.pulsed = True
+            if ctl & FIFOCTL1_PUSH and not old & FIFOCTL1_PUSH and f is not None and self.pulsed:
+                self.stuck = True
+                self.log.append((c.clock, "push after the RX suspend pulse"))
         if ctl & FIFOCTL1_STREAM and f is not None and not self.streaming and self.cut is None:
             self.streaming = True
             self.log.append((c.clock, "streams"))
