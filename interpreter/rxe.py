@@ -278,6 +278,7 @@ STAT40_B12 = 0x1000
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
 FIFOCTL1_SUSPEND = 0x0004       # the response's RX suspend pulse (0x0004, 0), push_hold
 PUSH_HOLD_BYTES, PUSH_HOLD_KEPT = 1232, 506    # push_hold: bytes until the hold ends, bytes then kept
+MEMBER_HELD = 4                 # bytes of an A-MPDU member before it can be dropped, a model
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
 FIFOCTL1_RESTART = 0x0040       # corerev 40+, written while the frame streams: the copy restarts (restart40)
 FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
@@ -710,7 +711,10 @@ class RxEngine:
             else:
                 self.push_due = (hdr, bool(ctl & FIFOCTL1_PAD))
                 self.log.append((c.clock, "push before the end"))
-        elif ctl & FIFOCTL1_DROP and f is not None:
+        elif ctl & FIFOCTL1_DROP and f is not None and \
+                not (f.member and self.held < PLCP_LEN + MEMBER_HELD):
+            # a member whose bytes have not come yet is not there to be dropped: 784.2 writes
+            # a bad member's drop twice within 1 us, and its Block Acks have holes
             self.dropped.append(f)
             self.log.append((c.clock, "drop"))
             if self.held < len(f.data) and not f.behind:
