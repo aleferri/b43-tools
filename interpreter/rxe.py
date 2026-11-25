@@ -40,7 +40,12 @@ b43_plcp_hdr6), then the MPDU with its FCS. From rx_frame(), in chip time:
               0x07E5; 0 makes it CCK): 1 for OFDM.
               The PHY's six RX status words: SPR_RXE_PHYRXSTAT0..3 and SPR
               0x022/0x023 (spr.inc's SPR_RXE_0x44/0x46), which ucode42 copies
-              to RX header words 2..7 and ucode30_mimo, 2..5.
+              to RX header words 2..7 and ucode30_mimo, 2..5. On corerev 40+
+              an A-MPDU's come at the end of its last MPDU; until then the
+              words are the reception's before (the RT-AC56U's BCM4352: every
+              member but the last had the header words 2..7 of a failed
+              reception before it, under the open ucode, and 784.2 marks
+              only the last one's RX status valid, MAC status bit 24).
               SPR 0x11F (spr.inc's SPR_TSF_0x3e) the TSF's low word, the RX
               header's mac_time (word 10).
               COND_RX_RAMATCH and COND_RX_BSSMATCH as given, while the frame
@@ -273,6 +278,7 @@ STAT40_B12 = 0x1000
 FIFOCTL1_PUSH, FIFOCTL1_DROP, FIFOCTL1_PAD = 0x0001, 0x0010, 0x0020
 FIFOCTL1_SUSPEND = 0x0004       # the response's RX suspend pulse (0x0004, 0), push_hold
 PUSH_HOLD_BYTES, PUSH_HOLD_KEPT = 1232, 506    # push_hold: bytes until the hold ends, bytes then kept
+MEMBER_HELD = 4                 # bytes of an A-MPDU member before it can be dropped, a model
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
 FIFOCTL1_RESTART = 0x0040       # corerev 40+, written while the frame streams: the copy restarts (restart40)
 FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
@@ -304,6 +310,7 @@ class RxFrame:
     behind: tuple = ()          # A-MPDU: the MPDUs after this one (MPDU and FCS each)
     member: bool = False        # an A-MPDU member after the first: no PLCP event
     eof: bool = None            # corerev 40+: a VHT PPDU of one MPDU: its delimiter's EOF (True: an S-MPDU), None: as a frame alone
+    behind_ok: tuple = ()       # A-MPDU: the FCS verdicts of the MPDUs `behind`, good where it is shorter
 
     def air(self):
         """From the first bit to the last, in microseconds."""
@@ -479,10 +486,8 @@ class RxEngine:
         if self.received == 0:
             spr[SPR_RXE_ENCODING] = (spr.get(SPR_RXE_ENCODING, 0) & ~ENCODING_OFDM) | \
                 (ENCODING_OFDM if f.ofdm else 0)
-            for n, v in zip((SPR_RXE_PHYRXSTAT0, SPR_RXE_PHYRXSTAT1,
-                             SPR_RXE_PHYRXSTAT2, SPR_RXE_PHYRXSTAT3,
-                             SPR_RXE_PHYRXSTAT4, SPR_RXE_PHYRXSTAT5), f.phyrxstat):
-                spr[n] = v & 0xFFFF
+            if not (c.hw.corerev >= 40 and (f.behind or f.member)):
+                self.phy_status(f)
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) & ~STATUS_COPIED | \
                 STATUS_PLCP | STATUS_DATA
             if c.hw.corerev >= 40:
@@ -560,6 +565,8 @@ class RxEngine:
             spr[SPR_RXE_STATUS] = spr.get(SPR_RXE_STATUS, 0) | STATUS_COPIED
         if not self.complete and (held == n if f.behind else c.clock >= self.t_end):
             self.complete = True
+            if c.hw.corerev >= 40 and f.member and not f.behind:
+                self.phy_status(f)
             self.levels.add(COND_RX_COMPLETE)
             c.events.add(COND_RX_COMPLETE)
             c.napping = False
@@ -572,6 +579,13 @@ class RxEngine:
             self.log.append((c.clock, "complete"))
             if self.push_due:
                 self.deliver(*self.push_due)
+
+    def phy_status(self, f):
+        """The PHY's six RX status words, as the ucode reads them."""
+        for n, v in zip((SPR_RXE_PHYRXSTAT0, SPR_RXE_PHYRXSTAT1,
+                         SPR_RXE_PHYRXSTAT2, SPR_RXE_PHYRXSTAT3,
+                         SPR_RXE_PHYRXSTAT4, SPR_RXE_PHYRXSTAT5), f.phyrxstat):
+            self.chip.m.spr[n] = v & 0xFFFF
 
     def copy_lead(self):
         """Whether the frame starts one word into the copy: with the HT and
@@ -697,7 +711,10 @@ class RxEngine:
             else:
                 self.push_due = (hdr, bool(ctl & FIFOCTL1_PAD))
                 self.log.append((c.clock, "push before the end"))
-        elif ctl & FIFOCTL1_DROP and f is not None:
+        elif ctl & FIFOCTL1_DROP and f is not None and \
+                not (f.member and self.held < PLCP_LEN + MEMBER_HELD):
+            # a member whose bytes have not come yet is not there to be dropped: 784.2 writes
+            # a bad member's drop twice within 1 us, and its Block Acks have holes
             self.dropped.append(f)
             self.log.append((c.clock, "drop"))
             if self.held < len(f.data) and not f.behind:
@@ -741,8 +758,12 @@ class RxEngine:
         self.levels &= {COND_RX_FIFOBUSY}
         if f.behind:
             # The next A-MPDU member, at the rate of the one before.
+            # its FCS verdict is its own: the one before's falls (the BCM4352: bad
+            # members after good ones are told apart).
+            self.chip.events.discard(COND_RX_FCS_GOOD)
             mpdu = f.behind[0]
             air = None if f.air_us is None else \
                 (f.air_us - f.plcp_us) * len(mpdu) / max(1, len(f.data) - PLCP_LEN)
             self.start(self.chip.clock, replace(f, data=bytes(PLCP_LEN) + mpdu, behind=f.behind[1:],
+                                                fcs_ok=f.behind_ok[0] if f.behind_ok else True, behind_ok=f.behind_ok[1:],
                                                 member=True, plcp_us=0.0, air_us=air))
