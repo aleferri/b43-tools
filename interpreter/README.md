@@ -203,6 +203,22 @@ they predict right:
 
     ./devcheck.py cold01-clean.txt --phy-type 0xb --radio-id 0x2069
 
+`board.py` is the whole board as the host sees it through its PCI function:
+BAR0 and the vendor configuration registers, routed by backplane address to
+the models of the chip's cores. A read no core models goes to a fallback by
+BAR0 offset, `replay.py`, which answers it from a capture: each register's
+values in the capture's order, the D11's data ports keyed by the index last
+written. The board counts those reads by backplane address, which is what of
+the board is still to be modelled, and the replay counts how closely the
+driver retraces the capture. `boardd.py` serves the board to QEMU's
+`bcm-board` device (`../qemu/`), so that a driver in a guest runs on it:
+
+    ./boardd.py --socket /tmp/board.sock --trace attach.txt --bar-size 0x8000
+
+No core is modelled yet: the board is the capture's. With wl 6.30.223.271 on
+the HP 2230's BCM43142 capture, wl attaches and brings the interface up on
+it, retracing the capture's first 61616 accesses but for 3394.
+
 `lockstep.py` co-simulates a host op stream with the ucode as one machine:
 the PSM starts at PC 0 on PSM_RUN and runs `--cycles` instructions after
 every host operation, over shared memory and an IHR register file the
