@@ -1,0 +1,34 @@
+diff -ruN a/hw/misc/Kconfig b/hw/misc/Kconfig
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -201,3 +201,8 @@
+     bool
+ 
+ source macio/Kconfig
++
++config BCM_BOARD
++    bool
++    default y if TEST_DEVICES
++    depends on PCI
+diff -ruN a/hw/misc/meson.build b/hw/misc/meson.build
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -1,5 +1,6 @@
+ system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
+ system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))
++system_ss.add(when: 'CONFIG_BCM_BOARD', if_true: files('bcm_board.c'))
+ system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -160,7 +160,7 @@
+ foreach target : edk2_targets
+   if target in target_dirs
+     bzip2 = find_program('bzip2', required: get_option('install_blobs'))
+-    unpack_edk2_blobs = bzip2.found()
++    unpack_edk2_blobs = false
+     break
+   endif
+ endforeach
