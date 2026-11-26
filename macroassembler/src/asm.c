@@ -1050,6 +1050,14 @@ static void do_equ(const char *name, const char *text, const struct srcloc *loc)
 		diag_quiet(0);
 	}
 	if (r == 0) {
+		struct sym *old = sym_get(in_proc() ? as.proc->scope : as.global, name);
+
+		if (old && old->kind == S_CONST && old->val.kind == v.kind &&
+		    old->val.rc == v.rc && old->val.n == v.n && value_known(&v) &&
+		    value_known(&old->val)) {
+			free(t);
+			return;
+		}
 		s = define(name, S_CONST, 0, loc);
 		if (s) {
 			s->val = v;

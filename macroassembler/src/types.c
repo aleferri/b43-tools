@@ -77,7 +77,26 @@ int eval_text(const char *text, struct value *v, const struct srcloc *loc)
 	return r;
 }
 
-/* Index of the '>' closing the '<' at s[0], or 0 if there is none. */
+static int operand_end(const char *s, size_t i)
+{
+	while (i > 0 && isspace((unsigned char)s[i - 1]))
+		i--;
+	return i > 0 && (is_ident_char((unsigned char)s[i - 1]) || s[i - 1] == ')' ||
+			 s[i - 1] == ']' || s[i - 1] == '\'' || s[i - 1] == '"');
+}
+
+static int operand_start(const char *s, size_t i)
+{
+	while (s[i] && isspace((unsigned char)s[i]))
+		i++;
+	return is_ident_char((unsigned char)s[i]) || s[i] == '(' || s[i] == '[' ||
+	       s[i] == '-' || s[i] == '~' || s[i] == '\'' || s[i] == '"';
+}
+
+/*
+ * Index of the '>' closing the '<' at s[0], or 0 if there is none. A '<' or
+ * '>' (or '<<', '>>', '<=', '>=') between two operands is an operator.
+ */
 static size_t angle_end(const char *s)
 {
 	size_t i;
@@ -85,18 +104,33 @@ static size_t angle_end(const char *s)
 	char quote = 0;
 
 	for (i = 0; s[i]; i++) {
+		char c = s[i];
+		size_t n;
+
 		if (quote) {
-			if (s[i] == quote)
+			if (c == quote)
 				quote = 0;
-		} else if (s[i] == '!' && s[i + 1]) {
+			continue;
+		}
+		if (c == '!' && s[i + 1] && s[i + 1] != '=') {
 			i++;
-		} else if (s[i] == '"' || s[i] == '\'') {
-			quote = s[i];
-		} else if (s[i] == '<') {
+			continue;
+		}
+		if (c == '"' || c == '\'') {
+			quote = c;
+			continue;
+		}
+		if (c != '<' && c != '>')
+			continue;
+		n = (s[i + 1] == c || s[i + 1] == '=') ? 2 : 1;
+		if (i > 0 && operand_end(s, i) && operand_start(s, i + n)) {
+			i += n - 1;
+			continue;
+		}
+		if (c == '<') {
 			depth++;
-		} else if (s[i] == '>') {
-			if (--depth == 0)
-				return i;
+		} else if (--depth == 0) {
+			return i;
 		}
 	}
 	return 0;
