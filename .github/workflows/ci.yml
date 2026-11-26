@@ -45,6 +45,16 @@ jobs:
           echo "distclean..."
           make distclean
 
+      # b43-masm
+      - name: b43-masm
+        run: |
+          cd macroassembler
+          make V=1
+          make -C ../assembler
+          make check
+          make clean
+          make -C ../assembler distclean
+
       # b43-dasm
       - name: b43-dasm
         run: |
