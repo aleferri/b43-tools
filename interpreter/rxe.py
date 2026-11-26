@@ -104,7 +104,9 @@ The ucode's writes of SPR_RXE_FIFOCTL1:
               from word SPR_RXE_RXHDR_OFFSET (OpenFWWF 10, ucode30_mimo 12,
               ucode42 14), two bytes of padding if bit 5 is set, then the
               frame, go to the FIFO and the frame ends; made before the
-              frame's end, at its end. COND_RX_FIFOBUSY while the copy lasts:
+              frame's end, at its end (with `push_at_end`: nothing; the push
+              at the end does it, as the RT-AC56U delivers the A-MPDU members
+              an open ucode arms with 0x1821 at their start). COND_RX_FIFOBUSY while the copy lasts:
               every ucode waits for it to rise and fall. On the chip
               SPR_RXE_RXHDR_OFFSET then moves on by the words taken (784.2's
               ucode30_mimo on the BCM43217: 0x0766 -> 0x0772 after every
@@ -130,7 +132,14 @@ arrive:
                     being received, dropped or not, whatever is written
                     meanwhile (0x0904 after 0x0110, 0x0804 and 0x0C22 to its
                     last byte; clear at once at idle); bit 2 is the RX
-                    suspend every ucode sets before a MAC suspend and waits on
+                    suspend every ucode sets before a MAC suspend and waits on.
+                    With `drop40_clear`, bit 2 of an A-MPDU member's drop
+                    (0x0014 / 0x0110) clears DROP40_CLEAR_US later instead:
+                    784.2's FIFOCTL1 sampled on the RT-AC56U during an HT20
+                    upload is 0x0904 and then 0x0900 for a while after each
+                    member drop, never 0x0804 / 0x1804 / 0x1826, and an open
+                    ucode that waits for bit 2 there sees it clear within 50 us
+                    in all but ~4% of the drops
   the others        as written: bit 0 after a push until a write clears it
                     (0x0801 up to the next PLCP); bits 3, 14 and 15 are not
                     measured
@@ -283,6 +292,8 @@ MEMBER_HELD = 4                 # bytes of an A-MPDU member before it can be dro
 FIFOCTL1_STREAM = 0x0080        # the frame leaves the RX buffer as it arrives (rx_buffer)
 FIFOCTL1_RESTART = 0x0040       # corerev 40+, written while the frame streams: the copy restarts (restart40)
 FIFOCTL1_SET40, FIFOCTL1_TAKEN40, FIFOCTL1_HELD40 = 0x0800, 0x20D0, 0x0404
+# corerev 40+, drop40_clear: us after a member's drop (FIFOCTL1 bit 4 or 8 written while the PPDU lasts) the RXE clears bit 2
+DROP40_CLEAR_US = 20.0
 RX_BUFFER_CHIP = {30: 383, 42: 1020}   # corerev: bytes a held frame is cut at on the RT-AC56U
 SPR_RXE_DMA40, DMA40_ON = 0x290, 0x0001
 FRAMELEN_SHORT = {30: 2}        # corerev: bytes SPR_RXE_FRAMELEN never counts
@@ -372,6 +383,9 @@ class RxEngine:
         self.next40_mark = False    # corerev 40+: a mark write in an A-MPDU member makes SPR 0x02B read 0x8000
         self.hdr_offset_moves = False  # SPR_RXE_RXHDR_OFFSET moves past the header a push takes (the chip)
         self.mark40_equal = False   # corerev 40+: a mark written equal to the frame's count raises no event (the chip)
+        self.drop40_clear = False   # corerev 40+: bit 2 clears after a member's drop, not held to the air's end (the chip)
+        self.push_at_end = False    # a push before the frame's end takes the RX header at the end (the chip)
+        self.bit2_clear_at = None
         self.push_hold = False      # corerev 42: a push after the RX suspend pulse holds the next frame (the chip)
         self.pulsed = False         # push_hold: FIFOCTL1 bit 2 written with the frame received and not pushed
         self.stuck = False          # push_hold: the next frame is held
@@ -436,6 +450,8 @@ class RxEngine:
         if self.on_air() and c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40 \
                 and c.hw.corerev >= 40:
             due.append(self.air_end)
+        if self.bit2_clear_at is not None:
+            due.append(self.bit2_clear_at)
         return min(due) if due else None
 
     def _clock(self, us):
@@ -467,6 +483,13 @@ class RxEngine:
         if c.hw.corerev >= 40 and not self.on_air() and \
                 c.m.spr.get(SPR_RXE_FIFOCTL1, 0) & FIFOCTL1_HELD40:
             self.read_back(c.m.spr[SPR_RXE_FIFOCTL1])
+        if self.bit2_clear_at is not None and c.clock >= self.bit2_clear_at:
+            # drop40_clear: the chip ends a member's drop with bit 2 clear (784.2's 0x0904 -> 0x0900)
+            self.bit2_clear_at = None
+            v = c.m.spr.get(SPR_RXE_FIFOCTL1, 0)
+            if v & 0x0004:
+                c.m.spr[SPR_RXE_FIFOCTL1] = v & ~0x0004
+                self.log.append((c.clock, "bit 2 cleared after the drop"))
         if self.dropped_on_air is not None:
             d = self.dropped_on_air
             n = len(d.data)
@@ -577,7 +600,13 @@ class RxEngine:
                 spr[SPR_RXE_NEXT] = (len(f.behind[0]) & 0x0FFF) if f.behind else NEXT_NONE
             self.log.append((c.clock, "complete"))
             if self.push_due:
-                self.deliver(*self.push_due)
+                hdr, pad = self.push_due
+                if hdr is None:
+                    base, length = spr.get(SPR_RXE_RXHDR_OFFSET, 0), spr.get(SPR_RXE_RXHDR_LEN, 0)
+                    hdr = b"".join(c.m.shm[(base + k) & (len(c.m.shm) - 1)].to_bytes(2, "little") for k in range(length))
+                    if self.hdr_offset_moves:
+                        spr[SPR_RXE_RXHDR_OFFSET] = (base + length) & 0xFFFF
+                self.deliver(hdr, pad)
 
     def phy_status(self, f):
         """The PHY's six RX status words, as the ucode reads them."""
@@ -714,6 +743,14 @@ class RxEngine:
                 spr[SPR_RXE_RXHDR_OFFSET] = (base + length) & 0xFFFF
             if self.complete:
                 self.deliver(hdr, bool(ctl & FIFOCTL1_PAD))
+            elif self.push_at_end:
+                # the chip: a push bit rising while a member arrives, before its end, pushes nothing
+                # (after a member drop the open ucode arms the next one with 0x1821 at its start, then
+                # pushes it with 0x1823 at its end; on the RT-AC56U those members reach the host whole,
+                # 0.002% of an HT20 upload lost, and its Block Acks have the holes 784.2's have)
+                if self.hdr_offset_moves:
+                    spr[SPR_RXE_RXHDR_OFFSET] = base
+                self.log.append((c.clock, "push bit before the end: nothing pushed"))
             else:
                 self.push_due = (hdr, bool(ctl & FIFOCTL1_PAD))
                 self.log.append((c.clock, "push before the end"))
@@ -727,6 +764,8 @@ class RxEngine:
                 self.dropped_on_air = f
             self.end()
         self.read_back(ctl, old)
+        if self.drop40_clear and c.hw.corerev >= 40 and self.on_air() and ctl & (FIFOCTL1_DROP | 0x0100):
+            self.bit2_clear_at = c.clock + self._clock(DROP40_CLEAR_US)
 
     def read_back(self, ctl, before=0):
         """SPR_RXE_FIFOCTL1 as the hardware leaves it after `ctl`, written

@@ -66,6 +66,9 @@ CHIP_RXE = (
     ("mark40_equal", "corerev 40+: a mark written equal to the frame's count raises no "
                      "COND_RX_COMPLETE, as on the BCM4352"),
     ("push_hold", "corerev 40+: a push after the RX suspend pulse holds the next frame, as on the BCM4352"),
+    ("drop40_clear", "corerev 40+: bit 2 clears after a member's drop instead of holding to the PPDU's end, "
+                     "as on the BCM4352"),
+    ("push_at_end", "a push bit rising before the frame's end pushes nothing (the push at its end does), as on the BCM4352"),
 )
 
 
