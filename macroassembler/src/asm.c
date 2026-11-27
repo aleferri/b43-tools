@@ -1594,7 +1594,9 @@ static void do_local(const char *text, const struct srcloc *loc)
 	size_t i;
 
 	if (!in_proc()) {
-		diag_error(loc, "LOCAL outside a PROC or a macro");
+		diag_error(loc, src_in_expansion() ?
+			   "a macro's LOCAL must come before any other line of its body" :
+			   "LOCAL outside a PROC or a macro");
 		return;
 	}
 	bl.text = xstrdup(text);
